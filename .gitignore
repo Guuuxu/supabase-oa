@@ -30,4 +30,3 @@ history/*.json
 .env
 .env.local
 *.md
-*.sql
