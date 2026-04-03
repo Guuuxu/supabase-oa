@@ -1,0 +1,1 @@
+select id, role, is_active from public.profiles;

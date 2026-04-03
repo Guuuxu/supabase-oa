@@ -1,0 +1,223 @@
+// 用户角色类型
+export type UserRole = 'super_admin' | 'manager' | 'employee';
+
+// 员工状态类型
+export type EmployeeStatus = 'active' | 'on_leave' | 'vacation' | 'standby' | 'business_trip' | 'resigned';
+
+// 文书分类类型
+export type DocumentCategory = 'onboarding' | 'employment' | 'resignation' | 'compensation' | 'certificate';
+
+// 签署状态类型
+export type SigningStatus = 'pending' | 'employee_signed' | 'company_signed' | 'completed' | 'rejected';
+
+// 通知类型
+export type NotificationType = 'contract_expiry' | 'document_signing' | 'employee_onboarding' | 'system';
+
+// 用户资料接口
+export interface Profile {
+  id: string;
+  username: string;
+  full_name?: string;
+  phone?: string;
+  role: UserRole;
+  company_id?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+// 公司接口
+export interface Company {
+  id: string;
+  name: string;
+  code: string;
+  contact_person?: string;
+  contact_phone?: string;
+  address?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+// 员工接口
+export interface Employee {
+  id: string;
+  company_id: string;
+  name: string;
+  employee_number: string;
+  phone?: string;
+  email?: string;
+  position?: string;
+  department?: string;
+  status: EmployeeStatus;
+  hire_date?: string;
+  contract_start_date?: string;
+  contract_end_date?: string;
+  created_at: string;
+  updated_at: string;
+  company?: Company;
+}
+
+// 文书模板接口
+export interface DocumentTemplate {
+  id: string;
+  company_id: string;
+  name: string;
+  category: DocumentCategory;
+  content?: string;
+  requires_company_signature: boolean;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+  company?: Company;
+}
+
+// 签署记录接口
+export interface SigningRecord {
+  id: string;
+  company_id: string;
+  employee_id: string;
+  template_ids: string[];
+  status: SigningStatus;
+  employee_signed_at?: string;
+  company_signed_at?: string;
+  third_party_signing_id?: string;
+  notes?: string;
+  created_by?: string;
+  created_at: string;
+  updated_at: string;
+  company?: Company;
+  employee?: Employee;
+  templates?: DocumentTemplate[];
+}
+
+// 权限接口
+export interface Permission {
+  id: string;
+  code: string;
+  name: string;
+  description?: string;
+  created_at: string;
+}
+
+// 角色接口
+export interface Role {
+  id: string;
+  name: string;
+  description?: string;
+  company_id?: string;
+  is_system_role: boolean;
+  created_at: string;
+  updated_at: string;
+  permissions?: Permission[];
+}
+
+// 角色权限关联接口
+export interface RolePermission {
+  role_id: string;
+  permission_id: string;
+}
+
+// 用户角色关联接口
+export interface UserRoleAssignment {
+  user_id: string;
+  role_id: string;
+}
+
+// 通知接口
+export interface Notification {
+  id: string;
+  user_id?: string;
+  type: NotificationType;
+  title: string;
+  content?: string;
+  is_read: boolean;
+  related_id?: string;
+  created_at: string;
+}
+
+// 提醒配置接口
+export interface ReminderConfig {
+  id: string;
+  company_id: string;
+  contract_expiry_days: number;
+  enable_sms: boolean;
+  enable_in_app: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+// 文书分类标签映射
+export const DOCUMENT_CATEGORY_LABELS: Record<DocumentCategory, string> = {
+  onboarding: '入职管理',
+  employment: '在职管理',
+  resignation: '离职管理',
+  compensation: '薪酬管理',
+  certificate: '证明开具'
+};
+
+// 文书模板名称映射
+export const DOCUMENT_TEMPLATE_NAMES: Record<DocumentCategory, string[]> = {
+  onboarding: [
+    '入职信息登记表',
+    '劳动合同',
+    '岗位职责',
+    '员工手册',
+    '规章制度',
+    '保密协议',
+    '竞业禁止协议',
+    '培训协议'
+  ],
+  employment: [
+    '劳动合同续签',
+    '劳动合同变更协议',
+    '岗位调整',
+    '薪酬调整',
+    '职级调整',
+    '限期返岗通知书',
+    '记过确认通知书',
+    '请假条'
+  ],
+  resignation: [
+    '离职申请',
+    '离职交接确认表',
+    '解除劳动合同协议',
+    '离职证明',
+    '保密协议确认书',
+    '竞业协议确认书'
+  ],
+  compensation: [
+    '考勤确认',
+    '绩效考核确认',
+    '工资条确认'
+  ],
+  certificate: [
+    '收入证明',
+    '离职证明',
+    '在职证明'
+  ]
+};
+
+// 员工状态标签映射
+export const EMPLOYEE_STATUS_LABELS: Record<EmployeeStatus, string> = {
+  active: '在职',
+  on_leave: '请假',
+  vacation: '休假',
+  standby: '待岗',
+  business_trip: '出差',
+  resigned: '离职'
+};
+
+// 签署状态标签映射
+export const SIGNING_STATUS_LABELS: Record<SigningStatus, string> = {
+  pending: '待签署',
+  employee_signed: '员工已签署',
+  company_signed: '公司已签署',
+  completed: '已完成',
+  rejected: '已拒绝'
+};
+
+// 用户角色标签映射
+export const USER_ROLE_LABELS: Record<UserRole, string> = {
+  super_admin: '超级管理员',
+  manager: '主管',
+  employee: '员工'
+};
