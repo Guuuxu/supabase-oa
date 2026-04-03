@@ -1,6 +1,8 @@
 # Supabase
 .branches
 .temp
+functions/add-asign-signatory
+functions/asign-notify
 
 # dotenvx
 .env.keys
