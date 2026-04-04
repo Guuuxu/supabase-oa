@@ -241,10 +241,12 @@ export default function RolesPage() {
     } else if (code.startsWith('employee_')) {
       moduleName = '👥 员工管理';
     }
-    // 文书管理
+    // 文书管理（与侧边栏「文书管理」子项一致：签署流程 vs 已签档案/历史）
     else if (code.startsWith('template_')) {
       moduleName = '📄 文书模板';
-    } else if (code.startsWith('document_') || code.startsWith('signing_') || code.startsWith('signed_')) {
+    } else if (code.startsWith('signed_') || code.startsWith('document_history_')) {
+      moduleName = '📁 文书档案';
+    } else if (code.startsWith('document_') || code.startsWith('signing_')) {
       moduleName = '✍️ 文书签署';
     }
     // 薪资管理
@@ -300,6 +302,7 @@ export default function RolesPage() {
     '👥 员工管理',
     '📄 文书模板',
     '✍️ 文书签署',
+    '📁 文书档案',
     '💰 薪资管理',
     '📅 考勤管理',
     '👤 用户管理',

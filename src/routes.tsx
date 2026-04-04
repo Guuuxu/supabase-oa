@@ -93,6 +93,11 @@ const routes: RouteConfig[] = [
     element: <EmployeeDocumentRecordsPage />
   },
   {
+    name: '工资结构',
+    path: '/salary-templates',
+    element: <SalaryTemplatesPage />
+  },
+  {
     name: '工资表管理',
     path: '/salary-records',
     element: <SalaryRecordsPage />

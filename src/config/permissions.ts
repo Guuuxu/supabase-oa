@@ -273,6 +273,69 @@ export const PERMISSION_GROUPS: PermissionGroup[] = [
 ];
 
 /**
+ * 侧边栏可见性：数据库中仍存在的旧码 / 与分组主码并行的其它命名（如 00001 的 *_manage、00084 的 salary_structure_*、
+ * 00073 的 attendance_sign_manage、RLS 曾用的 signed_file_download）。按 PERMISSION_GROUPS 的 key 合并进 alternates。
+ */
+export const SIDEBAR_LEGACY_CODES_BY_GROUP: Partial<Record<string, string[]>> = {
+  dashboard: [],
+  customer: [],
+  company: ['company_manage'],
+  employee: [
+    'employee_manage',
+    'employee_status_manage',
+    'subordinate_view',
+    'subordinate_manage',
+  ],
+  template: ['template_manage'],
+  /** 流程：旧码仅用于「文书签署」菜单，不应用来放行档案/历史（否则只勾「文书发起」会出现档案下载） */
+  signing: ['document_view', 'document_initiate', 'document_manage'],
+  /**
+   * 档案/历史：仅认可「档案类」旧码；document_initiate / document_view 只看签署列表，不等同于可下载已签文件或看历史
+   */
+  document_archive: ['signed_file_download', 'document_manage'],
+  salary_structure: [
+    'salary_structure_view',
+    'salary_structure_create',
+    'salary_structure_edit',
+    'salary_structure_delete',
+    'document_view',
+  ],
+  salary_record: ['document_view', 'salary_record_manage'],
+  salary_item: ['document_view', 'salary_record_manage'],
+  salary_signing: ['document_view'],
+  salary_archive: ['signed_file_download', 'document_view'],
+  attendance: ['document_view', 'attendance_sign_manage'],
+  batch_operation: [],
+  sms: [],
+  user: ['user_manage'],
+  role: ['role_permission_manage', 'role_assign'],
+  notification: ['notification_manage'],
+  audit: ['system_config_view'],
+  system_config: ['system_config'],
+  tools: [],
+  subordinate: [],
+};
+
+function uniqStrings(list: string[]): string[] {
+  return [...new Set(list)];
+}
+
+/**
+ * 侧边栏菜单与 PERMISSION_GROUPS 对齐，并合并同组内其它标准码 + SIDEBAR_LEGACY_CODES_BY_GROUP + 单项附加码。
+ */
+export function sidebarCodesFromPermissionGroup(
+  groupKey: string,
+  primary: string,
+  itemExtra: string[] = []
+): { permission: string; permissionAlternates: string[] } {
+  const g = PERMISSION_GROUPS.find((x) => x.key === groupKey);
+  const fromGroup = g ? g.permissions.filter((c) => c !== primary) : [];
+  const legacy = SIDEBAR_LEGACY_CODES_BY_GROUP[groupKey] ?? [];
+  const permissionAlternates = uniqStrings([...fromGroup, ...legacy, ...itemExtra]);
+  return { permission: primary, permissionAlternates };
+}
+
+/**
  * 权限代码到名称的映射
  */
 export const PERMISSION_LABELS: Record<string, string> = {

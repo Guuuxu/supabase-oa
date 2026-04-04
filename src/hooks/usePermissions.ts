@@ -1,16 +1,37 @@
 import { useState, useEffect } from 'react';
 import { supabase } from '@/db/supabase';
+import { getCurrentUserPermissions } from '@/db/api';
 
 /**
- * 权限管理Hook
- * 用于检查当前用户是否拥有特定权限
+ * 权限管理Hook（与侧边栏使用同一套 getCurrentUserPermissions）
  */
 export function usePermissions() {
   const [permissions, setPermissions] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    const loadPermissions = async () => {
+      try {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (!user) {
+          setPermissions([]);
+          setLoading(false);
+          return;
+        }
+        const codes = await getCurrentUserPermissions();
+        setPermissions(codes);
+      } catch (error) {
+        console.error('加载权限失败:', error);
+        setPermissions([]);
+      } finally {
+        setLoading(false);
+      }
+    };
     loadPermissions();
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(() => {
+      void loadPermissions();
+    });
+    return () => subscription.unsubscribe();
   }, []);
 
   const loadPermissions = async () => {
@@ -21,38 +42,12 @@ export function usePermissions() {
         setLoading(false);
         return;
       }
-
-      // 获取用户的角色ID
-      const { data: profile } = await supabase
-        .from('profiles')
-        .select('role_id')
-        .eq('id', user.id)
-        .maybeSingle();
-
-      const roleId = (profile as any)?.role_id;
-      if (!roleId) {
-        setPermissions([]);
-        setLoading(false);
-        return;
-      }
-
-      // 获取角色的权限列表
-      const { data: rolePermissions } = await supabase
-        .from('role_permissions')
-        .select('permission_id, permissions!permission_id(code)')
-        .eq('role_id', roleId);
-
-      if (rolePermissions && Array.isArray(rolePermissions)) {
-        const permissionCodes = rolePermissions
-          .map((rp: any) => rp.permissions?.code)
-          .filter(Boolean) as string[];
-        setPermissions(permissionCodes);
-      }
-
-      setLoading(false);
+      const codes = await getCurrentUserPermissions();
+      setPermissions(codes);
     } catch (error) {
       console.error('加载权限失败:', error);
       setPermissions([]);
+    } finally {
       setLoading(false);
     }
   };

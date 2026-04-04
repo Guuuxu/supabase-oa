@@ -1,6 +1,6 @@
-import { createContext, useContext, useEffect, useState, type ReactNode } from 'react';
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
 import { supabase } from '@/db/supabase';
-import type { User } from '@supabase/supabase-js';
+import type { Session, User } from '@supabase/supabase-js';
 import type { Profile } from '@/types/types';
 
 export async function getProfile(userId: string): Promise<Profile | null> {
@@ -44,6 +44,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [loading, setLoading] = useState(true);
+  /** 切换登录用户时先清空 profile，避免 JWT 已是新人但 context 仍短暂保留旧人资料（菜单权限串台） */
+  const authUserIdRef = useRef<string | null>(null);
 
   const refreshProfile = async () => {
     if (!user) {
@@ -56,21 +58,28 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
+    const applySession = (session: Session | null) => {
+      const newId = session?.user?.id ?? null;
       setUser(session?.user ?? null);
-      if (session?.user) {
-        getProfile(session.user.id).then(setProfile);
+      if (!session?.user) {
+        authUserIdRef.current = null;
+        setProfile(null);
+        return;
       }
+      if (authUserIdRef.current !== newId) {
+        authUserIdRef.current = newId;
+        setProfile(null);
+      }
+      getProfile(session.user.id).then(setProfile);
+    };
+
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      applySession(session);
       setLoading(false);
     });
     // In this function, do NOT use any await calls. Use `.then()` instead to avoid deadlocks.
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      setUser(session?.user ?? null);
-      if (session?.user) {
-        getProfile(session.user.id).then(setProfile);
-      } else {
-        setProfile(null);
-      }
+      applySession(session);
     });
 
     return () => subscription.unsubscribe();

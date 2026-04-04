@@ -1252,38 +1252,62 @@ export async function getPermissions(): Promise<Permission[]> {
   return Array.isArray(data) ? data : [];
 }
 
-// 获取当前用户的权限列表
+/** 解析用于拉取 role_permissions 的 roles.id（菜单、usePermissions 共用） */
+export async function resolveEffectiveRoleIdForPermissions(userId: string): Promise<string | null> {
+  const { data: profile, error: profileError } = await supabase
+    .from('profiles')
+    .select('role_id, role')
+    .eq('id', userId)
+    .maybeSingle();
+
+  if (profileError) {
+    console.error('获取用户资料失败:', profileError);
+    return null;
+  }
+  if (!profile) return null;
+
+  const typed = profile as { role_id?: string | null; role?: string };
+  if (typed.role_id) return typed.role_id;
+
+  // 历史数据：profiles.role = manager 但未绑定自定义角色时，按系统预设「主管」角色的权限
+  if (typed.role === 'manager') {
+    const { data: managerRole, error: roleErr } = await supabase
+      .from('roles')
+      .select('id')
+      .eq('name', '主管')
+      .eq('is_system_role', true)
+      .maybeSingle();
+    if (roleErr) {
+      console.error('解析主管预设角色失败:', roleErr);
+      return null;
+    }
+    return managerRole?.id ?? null;
+  }
+
+  return null;
+}
+
+// 获取当前用户的权限列表（与侧边栏菜单 permission 字段对应）
 export async function getCurrentUserPermissions(): Promise<string[]> {
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return [];
 
-  // 先获取用户的role_id
-  const { data: profile, error: profileError } = await supabase
-    .from('profiles')
-    .select('role_id')
-    .eq('id', user.id)
-    .single();
+  const roleId = await resolveEffectiveRoleIdForPermissions(user.id);
+  if (!roleId) return [];
 
-  if (profileError || !profile || !profile.role_id) {
-    console.error('获取用户角色失败:', profileError);
-    return [];
-  }
-
-  // 查询该角色的所有权限
   const { data: rolePermissions, error: permError } = await supabase
     .from('role_permissions')
     .select(`
       permission_id,
       permissions!permission_id(code)
     `)
-    .eq('role_id', profile.role_id);
+    .eq('role_id', roleId);
 
   if (permError) {
     console.error('获取角色权限失败:', permError);
     return [];
   }
 
-  // 提取权限code列表
   const permissions: string[] = [];
   if (Array.isArray(rolePermissions)) {
     rolePermissions.forEach((rp: any) => {
