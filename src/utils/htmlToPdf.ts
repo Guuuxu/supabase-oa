@@ -1,15 +1,11 @@
 import html2canvas from 'html2canvas';
 import jsPDF from 'jspdf';
 
-/** 控制台搜此前缀，对照签署调试日志 */
-const LOG = '[SIGNING_DEBUG][htmlToPdf]';
-
 /**
  * 将完整 HTML 文档字符串渲染为 PDF Blob（浏览器端，供爱签 contractFiles 上传）。
  * 使用离屏 iframe 解析 HTML，再用 html2canvas 截图分页写入 A4 PDF。
  */
 export async function htmlStringToPdfBlob(html: string): Promise<Blob> {
-  console.log(LOG, '开始转 PDF', { htmlChars: html.length });
   const iframe = document.createElement('iframe');
   iframe.setAttribute('title', 'html-to-pdf');
   iframe.style.position = 'fixed';
@@ -47,13 +43,6 @@ export async function htmlStringToPdfBlob(html: string): Promise<Blob> {
       throw new Error('PDF: HTML 无 body');
     }
 
-    console.log(LOG, 'iframe 内 body 尺寸', {
-      scrollWidth: body.scrollWidth,
-      scrollHeight: body.scrollHeight,
-      clientWidth: body.clientWidth,
-      clientHeight: body.clientHeight,
-    });
-
     const canvas = await html2canvas(body, {
       scale: 2,
       useCORS: true,
@@ -63,15 +52,7 @@ export async function htmlStringToPdfBlob(html: string): Promise<Blob> {
       windowHeight: body.scrollHeight,
     });
 
-    console.log(LOG, 'html2canvas 完成', {
-      canvasWidth: canvas.width,
-      canvasHeight: canvas.height,
-      scale: 2,
-      approxPixels: canvas.width * canvas.height,
-    });
-
     const imgData = canvas.toDataURL('image/jpeg', 0.92);
-    console.log(LOG, 'JPEG dataURL 长度（越大 PDF/base64 往往越大）', imgData.length);
     const pdf = new jsPDF({
       orientation: 'portrait',
       unit: 'mm',
@@ -95,18 +76,7 @@ export async function htmlStringToPdfBlob(html: string): Promise<Blob> {
       heightLeft -= pageH;
     }
 
-    const blob = pdf.output('blob');
-    const sizeMB = blob.size / 1024 / 1024;
-    console.log(LOG, 'PDF Blob 生成完成', {
-      sizeBytes: blob.size,
-      sizeMB: Number(sizeMB.toFixed(3)),
-      approxBase64Chars: Math.ceil((blob.size * 4) / 3),
-    });
-    return blob;
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    console.error(LOG, '转 PDF 失败', { msg, err: e });
-    throw e;
+    return pdf.output('blob');
   } finally {
     document.body.removeChild(iframe);
   }

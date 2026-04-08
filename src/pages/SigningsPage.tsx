@@ -203,9 +203,7 @@ export default function SigningsPage() {
           });
         },
       )
-      .subscribe((status) => {
-        console.log('[SIGNING_DEBUG] realtime', status);
-      });
+      .subscribe(() => {});
 
     return () => {
       void supabase.removeChannel(channel);
@@ -2619,6 +2617,78 @@ export default function SigningsPage() {
     return ordered;
   };
 
+  /**
+   * 与爱签 v2/user/addStranger 对齐：userType 1=企业、2=个人（以开放平台为准）；account 与 addSigner 一致。
+   */
+  const buildAsignStrangersForCreateSigning = (
+    employeeRows: EmployeeFormData[],
+    appendCompany?: typeof finalCompanyFormData,
+  ): Array<{
+    account: string;
+    userType: 1 | 2;
+    name?: string;
+    idCard?: string;
+    mobile?: string;
+    companyName?: string;
+    creditCode?: string;
+  }> => {
+    const out: Array<{
+      account: string;
+      userType: 1 | 2;
+      name?: string;
+      idCard?: string;
+      mobile?: string;
+      companyName?: string;
+      creditCode?: string;
+    }> = [];
+
+    const company = appendCompany;
+    if (company && (company.name || '').trim()) {
+      const credit = (company.code || '').trim().replace(/\s/g, '');
+      const contactMobile = (company.contact_phone || '').trim().replace(/\s/g, '');
+      const companyAccountRaw = (credit || contactMobile).toUpperCase();
+      const account = companyAccountRaw ? `ASIGN${companyAccountRaw}` : '';
+      if (account && contactMobile) {
+        const companyName = (company.name || '').trim();
+        const legalName =
+          (company.legal_representative || '').trim() ||
+          (company.contact_person || '').trim();
+        out.push({
+          account,
+          userType: 1,
+          mobile: contactMobile,
+          ...(companyName ? { companyName } : {}),
+          ...(credit ? { creditCode: credit } : {}),
+          ...(legalName ? { name: legalName } : {}),
+        });
+      }
+    }
+
+    for (const emp of employeeRows) {
+      const mobile = (emp.phone || '').trim().replace(/\s/g, '');
+      if (!mobile) {
+        continue;
+      }
+      const idCard = (emp.id_card || '').trim().replace(/\s/g, '').toUpperCase();
+      if (!idCard) {
+        throw new Error(
+          `电子签署要求员工身份证号，用于生成 account（规则：ASIGN+身份证号）。缺失员工：${emp.name || emp.id}`,
+        );
+      }
+      const account = `ASIGN${idCard}`;
+      const name = (emp.name || '').trim();
+      out.push({
+        account,
+        userType: 2,
+        idCard,
+        mobile,
+        ...(name ? { name } : {}),
+      });
+    }
+
+    return out;
+  };
+
   /** 发起签署用的 HTML：编辑中与 iframe 预览保持一致（未保存的 edits 从 contentEditable 取） */
   const getHtmlForSigningPdf = async (): Promise<string> => {
     if (isEditMode && editableRef.current) {
@@ -2634,22 +2704,27 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
     return res.text();
   };
 
-  const invokeCreateSigning = async () => {
-    console.log('[SIGNING_DEBUG] invokeCreateSigning 开始', {
-      hasPreviewFileUrl: Boolean(previewFileUrl),
-      supabaseUrl: import.meta.env.VITE_SUPABASE_URL,
-    });
+  const invokeCreateSigning = async (opts?: {
+    /** addStranger：userType 1=企业 2=个人 */
+    strangers?: Array<{
+      account: string;
+      userType: 1 | 2;
+      name?: string;
+      idCard?: string;
+      mobile?: string;
+      companyName?: string;
+      creditCode?: string;
+    }>;
+  }) => {
     if (!previewFileUrl) {
       throw new Error('缺少预览文件，无法发起签署');
     }
-    console.log('[SIGNING_DEBUG] previewFileUrl', previewFileUrl);
     const htmlText = await getHtmlForSigningPdf();
     toast.info('正在生成签署文件，请稍候…');
     let pdfBlob: Blob;
     try {
       pdfBlob = await htmlStringToPdfBlob(htmlText);
     } catch (e) {
-      console.error('[SIGNING_DEBUG] HTML 转 PDF 失败', e);
       const msg = e instanceof Error ? e.message : String(e);
       throw new Error(`文书转 PDF 失败：${msg}`);
     }
@@ -2670,7 +2745,6 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
       .filter(Boolean)
       .join('_') || '未命名员工';
     const userId = profile?.id ?? 'unknown';
-    console.log('[SIGNING_DEBUG] userId', userId);
     // 爱签 prev 环境限制 contractNo 最长 40（错误码 100577）；UUID+日期时间会超长，这里压缩为 ≤40 且仍含日期时间与用户标识片段
     const ASIGN_CONTRACT_NO_MAX = 40;
     const uuidCompact = String(userId).replace(/-/g, '');
@@ -2688,20 +2762,6 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
     }
     const filenameRaw = `签署文书_${employeeNames}_${dateStr}.pdf`;
     const filename = filenameRaw.replace(/[\\/:*?"<>|]/g, '_');
-    // try {
-    //   const downloadUrl = URL.createObjectURL(pdfBlob);
-    //   const link = document.createElement('a');
-    //   link.href = downloadUrl;
-    //   link.download = filename;
-    //   link.rel = 'noopener';
-    //   document.body.appendChild(link);
-    //   link.click();
-    //   document.body.removeChild(link);
-    //   URL.revokeObjectURL(downloadUrl);
-    //   console.log('[SIGNING_DEBUG][htmlToPdf] 已自动下载 PDF', filename);
-    // } catch (dlErr) {
-    //   console.warn('[SIGNING_DEBUG][htmlToPdf] 自动下载 PDF 失败（可忽略）', dlErr);
-    // }
     const fullName = typeof (profile as any)?.full_name === 'string' ? (profile as any).full_name : '';
     const username = typeof (profile as any)?.username === 'string' ? (profile as any).username : '';
     const displayName = (fullName || username || 'unknown').trim();
@@ -2709,14 +2769,11 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
     // 避免第三方对特殊字符不兼容
     const contractName = contractNameRaw.replace(/[\\/:*?"<>|]/g, '_');
 
-    console.log('[SIGNING_DEBUG] 即将请求 Edge Function create-signing（PDF）', {
-      contractNo,
-      base64Len: base64.length,
-    });
     const { data, error } = await supabase.functions.invoke('create-signing', {
       body: {
         contractNo,
         contractName,
+        ...(opts?.strangers?.length ? { strangers: opts.strangers } : {}),
         contractFiles: [
           {
             filename,
@@ -2727,29 +2784,7 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
       },
     });
 
-    console.log('[SIGNING_DEBUG] create-signing HTTP 层结果', {
-      hasInvokeError: Boolean(error),
-      invokeErrorMessage: error?.message,
-      dataKeys: data && typeof data === 'object' ? Object.keys(data as object) : data,
-      data,
-    });
-
     if (error) {
-      let responseBodyText = '';
-      const ctx = (error as { context?: Response }).context;
-      if (ctx && typeof ctx.text === 'function') {
-        try {
-          responseBodyText = await ctx.clone().text();
-        } catch {
-          responseBodyText = '(无法读取 Response body)';
-        }
-      }
-      console.error('[SIGNING_DEBUG] invoke 报错（可看 Network → create-signing → Response）', {
-        error,
-        data,
-        responseStatus: ctx?.status,
-        responseBodyText: responseBodyText.slice(0, 4000),
-      });
       throw error;
     }
 
@@ -2762,17 +2797,10 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
         detail?.msg ??
         (typeof payload.error === 'string' ? payload.error : '') ??
         'create-signing 失败';
-      console.error('[SIGNING_DEBUG] 函数返回 ok:false（爱签可能未请求）', payload);
       throw new Error(msg);
     }
 
     const effectiveContractNo = extractContractNoFromCreateSigningResponse(data, contractNo);
-    if (effectiveContractNo !== contractNo) {
-      console.log('[SIGNING_DEBUG] addSigner 将使用 effectiveContractNo（与爱签返回一致）', {
-        clientContractNo: contractNo,
-        effectiveContractNo,
-      });
-    }
 
     return { contractNo, effectiveContractNo, contractName, asign: data };
   };
@@ -3844,8 +3872,11 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                             }
                           }
 
-                          console.log('[SIGNING_DEBUG] 电子签署模式，调用 invokeCreateSigning');
-                          const result = await invokeCreateSigning();
+                          const strangers = buildAsignStrangersForCreateSigning(
+                            employeesFormData,
+                            needsCompanySigner ? finalCompanyFormData : undefined,
+                          );
+                          const result = await invokeCreateSigning({ strangers });
                           const contractNoForAsign = result.effectiveContractNo;
                           thirdPartyContractNo = contractNoForAsign;
                           thirdPartyContractName = result.contractName;
@@ -3859,12 +3890,8 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                             asignData?.asign?.contractId ??
                             asignData?.asign?.contract_id ??
                             undefined;
-                          console.log('[SIGNING] create-signing result:', result);
 
                           const contractAttachNo = getAsignCreateContractAttachNo(result.asign);
-                          console.log('[SIGNING_DEBUG] create 返回 attachNo（用于 signStrategyList）', {
-                            contractAttachNo,
-                          });
 
                           const signers = buildAsignAddSignerItemsForEmployees(employeesFormData, {
                             appendCompany: needsCompanySigner ? finalCompanyFormData : undefined,
@@ -3875,28 +3902,14 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                               '无法添加签署方：请确认员工手机号与企业联系电话已填写（noticeMobile）'
                             );
                           }
-                          console.log('[SIGNING_DEBUG] create-signing 成功后调用 addAsignSignatory', {
-                            contractNo: contractNoForAsign,
-                            signersCount: signers.length,
-                            needsCompanySigner,
-                          });
                           // signers 为数组：企业方 + 员工等须一次传齐；Edge 单次 addSigner，bizData 内为签署方数组（合同仅可调一次该接口）
-                          console.log('[SIGNING_DEBUG] addAsignSignatory 请求 payload（含 signers 逐项）', {
-                            contractNo: contractNoForAsign,
-                            signers,
-                          });
                           const addSignRes = await addAsignSignatory({
                             contractNo: contractNoForAsign,
                             signers,
                           });
-                          console.log('[SIGNING_DEBUG] addAsignSignatory 返回', addSignRes);
                           if (!addSignRes.success) {
                             throw new Error(addSignRes.error || '添加签署方失败');
                           }
-                        } else {
-                          console.log('[SIGNING_DEBUG] 非电子签署模式，跳过 create-signing', {
-                            signing_mode: formData.signing_mode,
-                          });
                         }
 
                         // 为每个员工创建签署记录

@@ -10,9 +10,10 @@ import { decodeBase64 } from "https://deno.land/std@0.224.0/encoding/base64.ts";
 export const ASIGN_PRIVATE_KEY_FALLBACK =
   "MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCeoodWSIfw7nNiieByJbmDVWWicJSd+6qaDhiXzECuxpmYTSdKXRBuF8h892TG86MrifOq2ftK+BWK0CcwA9u0TEFufsjEMS8LS/JhPUBQ7GRrq1JEuosryG/s+adFW4Iyt9b0PNnt68VsR8159hTKf8z1VH3iGLDrZ+6pZXXrdyS7E+TPxlUSqc/PbTWh5zoH2UEELzKrBtfAMz9OZVyLiDyLtlv6tNikluWiIbRI9xbP7WQTCMIC/7s0RiP0Y0XstJJ7S4PlB0GbhKeGHr7RW7iL0BqKN0017IvIPz4TiH/vjrQ17jZs8DWqtPevm67QKfdninacb7HUhH5PH1nBAgMBAAECggEAaOzvv25yHDZcM40m29l//xJ5CxyT8HsJuKQiOCVtkyzhYw+FMXak62znu2CXU9DK2H2CojtUL54wAYT0ppmmtHbLwJ4zhTFTAJHXW+H7rIrvURgcbkFE1EzbW082CHYihBF9KEcnjmsoRhqoGkdeMSKfGpYsPWQ/gTVZcsodWQSGsAHgyDK7haNHIjG0gL8jRGqFuqLQpJBUQ9qCuRJUkqeWwMtnZKJHXF15jYJrfLnpqhDvCBp/IU9+At3aTAql4RWwl0e6k8FFtno6/gTQnuyDXVDouf7FCt2kbfzDrtjeev4TwX63a1M+fZvsK5LqJKIiIq8tR1Zf9ESQxTbPUQKBgQDNd0jPV8J1nCFrvsDj8fI4MhbSEdHJYlqTT4h9nZrEw7782+fSyvVc6PQLjK+Z5TFnWX5rO3h4ahkybp/uB8dIGyAs1pnggt2LGYWY3ySlreE9xMV+D9IMwhiwupAOkbMxvmwOCALVgnoaK7z6dD03e26EtiVX9EekQsGENGzdLwKBgQDFpqCtI2zCeca0BP+e5Uylx5lRLNoGkWbVyjpqQ+JZAkZw8B5tT7ktE76AuY2kL7kUkXdaBR94OtGz9tUqdL3nBja5DLP9UYKAlBd5eRQ7pyswJHG8eEW+orn+LsXUd5/7IpSW07yZn0EcXW8Jlu+wVd1OhYsa+wDqDHqXNXbcDwKBgCcOp86SVirZNRkwN6adFXhNPT1Nmd14TtN16PJIBWWl+CZE/zp4zk+NEOcpJTBR+yQ0RO3JbkslkAigMtKis+UnEuSzHqko90g738OBl4vPE+QUBZ7DDyDRvLPLoxrB45hvJEc+iptfpCpZaiEJ+6ESW53qqgqgKwY0kmi5NoCNAoGAfsD+eCqovAt2p8ow2Ij637Iim9FkvSOQTHjVf4KrbSOtYw5KpRWkjskDue/Fa08DpbIoVX3Fkcg+5efdCs41Xyw3+fKwlzsnsyfF6iwBEsSBSO2GVzTWnYwkNWNvkXNqEJc7rYJ6iBZ+nh85b2/xpSdbttijvhjMnEyGbeRmpncCgYBddcdByOYjQ+bquEdsnEBU67kvdfCw1kF+j+Mfhuq5tfL9KR9+bL7/7y1Cp924DWIt0VFdNBueEsI0SmG0eKx+VHd6aEOhTZqpWY+N3urDTl3/vV5Ywsl0pyYnPVZyvAgcI4D6JWh/V2t+zXS1yd4d/jxQu/JArmBUhgThv78L8g==";
 
-/** 爱签业务成功：常见为 0；不少接口返回 100000 + msg「成功」 */
+/** 爱签业务成功：常见为 0；不少接口返回 100000 + msg「成功」；部分环境为 10000 */
 export function isAsignBizSuccessCode(code: unknown): boolean {
   if (code === 0 || code === "0") return true;
+  if (code === 10000 || code === "10000") return true;
   if (code === 100000 || code === "100000") return true;
   return false;
 }
@@ -29,6 +30,31 @@ export function isAsignBizSuccessResponse(asign: Record<string, unknown>): boole
   if (!asign || typeof asign !== "object") return false;
   if (isAsignBizFailureMessage(asign.msg)) return false;
   return isAsignBizSuccessCode(asign.code);
+}
+
+/**
+ * v2/user/addStranger：HTTP 200 但 code 非 0 时仍可能需继续流程（如 100021 用户已存在）。
+ * 须与 callAsignFormPost 中 path 含 addStranger 时的放行逻辑一致。
+ */
+export function isAsignAddStrangerBenignResponse(asign: Record<string, unknown>): boolean {
+  if (!asign || typeof asign !== "object") return false;
+  if (isAsignBizSuccessResponse(asign)) return true;
+
+  const codeStr = String(asign.code ?? "");
+  /** 爱签开放平台：100021 用户已存在；31100/31105 等兼容 */
+  const benignCodes = ["100021", "31100", "31105"];
+  if (benignCodes.includes(codeStr)) return true;
+
+  const msg = String(asign.msg ?? "");
+  if (
+    /已存在|已认证|已实名|实名认证|重复添加|已是正式用户|无需.*添加|用户已注册|不能重复|请勿重复/.test(msg)
+  ) {
+    return true;
+  }
+  if (/already\s+(registered|verified|authenticated|exists)/i.test(msg)) {
+    return true;
+  }
+  return false;
 }
 
 function base64ToBytes(base64: string): Uint8Array {
@@ -371,7 +397,6 @@ export type CallAsignFormPostArgs = {
   /** official_concat 尝试用的严格 JSON；不传则用 bizDataRecordLikeNodeDemoGeneric；仅对象根时生效 */
   strictBizDataOverride?: Record<string, unknown>;
   contractFiles?: AsignContractFile[];
-  debugLogPrefix?: string;
 };
 
 type AsignAttemptSpec = {
@@ -465,6 +490,7 @@ export async function callAsignFormPost(args: CallAsignFormPostArgs) {
     bizDataJsonStrict = JSON.stringify(strictForJson);
     bizData = bizDataForJson;
   }
+
   const timestampSec = String(Math.floor(Date.now() / 1000));
   const timestampMs = String(Date.now());
 
@@ -526,7 +552,6 @@ export async function callAsignFormPost(args: CallAsignFormPostArgs) {
   ];
 
   let lastFailure: unknown = null;
-  const logPrefix = args.debugLogPrefix ?? "[ASIGN]";
 
   /** 大文件时避免在每次签名校验重试里重复 base64 解码，减轻 Edge worker 内存与 GC 压力 */
   const rawContractFiles = args.contractFiles ?? [];
@@ -601,15 +626,6 @@ export async function callAsignFormPost(args: CallAsignFormPostArgs) {
       form.append("contractFiles", f.blob, f.filename);
     }
 
-    console.log(`${logPrefix} fetch asign:start`, {
-      url,
-      attempt: attempt.tag,
-      signHash: attempt.signHash,
-      signPlaintextMode: attempt.signPlaintextMode,
-      timestamp: ts,
-      useOfficialBizJson: Boolean(attempt.useOfficialBizJson),
-    });
-
     // 避免三方接口偶发卡死导致 Edge worker 无响应（前端看到 InvalidWorkerResponse）
     const timeoutMsRaw = (Deno.env.get("ASIGN_FETCH_TIMEOUT_MS") ?? "8000").trim();
     const timeoutMs = Math.max(1500, parseInt(timeoutMsRaw, 10) || 8000);
@@ -660,8 +676,10 @@ export async function callAsignFormPost(args: CallAsignFormPostArgs) {
     const asign = (parsed?.asign ?? parsed) as Record<string, unknown>;
     const asignCode = asign?.code;
     const isAsignError = !isAsignBizSuccessResponse(asign);
+    const addStrangerProceed =
+      pathClean.includes("addStranger") && isAsignAddStrangerBenignResponse(asign);
 
-    if (res.ok && !isAsignError) {
+    if (res.ok && (!isAsignError || addStrangerProceed)) {
       return { ok: true as const, status: res.status, data };
     }
 

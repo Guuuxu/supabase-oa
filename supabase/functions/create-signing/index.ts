@@ -12,12 +12,33 @@
  */
 import { serve } from "https://deno.land/std/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { callAsignFormPost, type AsignContractFile } from "../_shared/asign-client.ts";
+import {
+  callAsignFormPost,
+  isAsignAddStrangerBenignResponse,
+  type AsignContractFile,
+} from "../_shared/asign-client.ts";
 import { corsHeaders } from "../_shared/cors.ts";
+
+/**
+ * 爱签 v2/user/addStranger：与 addSigner 同一 account；userType 以开放平台为准：1 企业、2 个人。
+ */
+type CreateSigningStranger = {
+  account: string;
+  /** 1 企业 2 个人 */
+  userType: number;
+  name?: string;
+  idCard?: string;
+  mobile?: string;
+  companyName?: string;
+  creditCode?: string;
+};
 
 type CreateSigningBody = {
   user_id?: string;
   document_id?: string;
+
+  /** 创建合同前依次调用 v2/user/addStranger；成功后再 createContract */
+  strangers?: CreateSigningStranger[];
 
   contractNo: string;
   contractName: string;
@@ -80,6 +101,48 @@ function extractEffectiveContractNo(asignApiBody: unknown, requestedContractNo: 
 /**
  * 与爱签 Node 官方示例一致：filterEmpty（去掉 null/undefined/''）再按 key 字典序排序后 JSON.stringify。
  */
+function normalizeAsignPayload(data: unknown): Record<string, unknown> | null {
+  if (!data || typeof data !== "object") return null;
+  const root = data as Record<string, unknown>;
+  const inner = root.asign;
+  if (inner && typeof inner === "object") {
+    return inner as Record<string, unknown>;
+  }
+  return root;
+}
+
+/** 与 asign-client 中 callAsignFormPost + isAsignAddStrangerBenignResponse 一致（双层校验） */
+function isAddStrangerBizOk(data: unknown): boolean {
+  const asign = normalizeAsignPayload(data);
+  if (!asign) return false;
+  return isAsignAddStrangerBenignResponse(asign);
+}
+
+function strangerToBizData(s: CreateSigningStranger): Record<string, unknown> {
+  const account = (s.account ?? "").trim();
+  const userType = Number(s.userType);
+  const row: Record<string, unknown> = { account, userType };
+  if (userType === 1) {
+    const cn = (s.companyName ?? "").trim();
+    if (cn) row.companyName = cn;
+    const cc = (s.creditCode ?? "").trim();
+    if (cc) row.creditCode = cc;
+  }
+  const name = s.name;
+  if (name && String(name).trim()) {
+    row.name = String(name).trim();
+  }
+  const idc = (s.idCard ?? "").trim();
+  if (idc) {
+    row.idCard = idc;
+  }
+  const mobile = (s.mobile ?? "").trim();
+  if (mobile) {
+    row.mobile = mobile;
+  }
+  return row;
+}
+
 function bizDataRecordLikeNodeDemo(body: CreateSigningBody): Record<string, unknown> {
   const raw: Record<string, unknown> = {
     validityTime: body.validityTime ?? 30,
@@ -151,7 +214,6 @@ async function callAsignCreateContract(body: CreateSigningBody) {
     keepEmptyStringKeys: ["redirectUrl", "notifyUrl", "callbackUrl"],
     strictBizDataOverride: bizDataRecordLikeNodeDemo(body),
     contractFiles: body.contractFiles,
-    debugLogPrefix: "[SIGNING_DEBUG]",
   });
 }
 
@@ -173,12 +235,7 @@ serve(async (req) => {
       },
     });
 
-    const contentLengthHeader = req.headers.get("content-length") ?? "";
     const bodyText = await req.text();
-    console.log("[SIGNING_DEBUG] create-signing 收到请求", {
-      contentLengthHeader,
-      bodyChars: bodyText.length,
-    });
     let body: CreateSigningBody;
     try {
       body = JSON.parse(bodyText) as CreateSigningBody;
@@ -225,6 +282,33 @@ serve(async (req) => {
     }
 
     const bodyForAsign: CreateSigningBody = { ...body, contractFiles };
+
+    const strangersRaw = Array.isArray(body.strangers) ? body.strangers : [];
+    const seenStrangerAccounts = new Set<string>();
+    for (const s of strangersRaw) {
+      const bizData = strangerToBizData(s);
+      const acc = String(bizData.account ?? "").trim();
+      if (!acc || seenStrangerAccounts.has(acc)) continue;
+      seenStrangerAccounts.add(acc);
+      const addRes = await callAsignFormPost({
+        path: "v2/user/addStranger",
+        bizDataInput: bizData,
+      });
+      if (!addRes.ok || !isAddStrangerBizOk(addRes.data)) {
+        return json(
+          {
+            ok: false,
+            error: "爱签 addStranger 调用失败",
+            status: addRes.status,
+            detail: addRes.data,
+            debug: addRes.debug,
+            failedStrangerAccount: acc,
+          },
+          200,
+        );
+      }
+    }
+
     const asignResult = await callAsignCreateContract(bodyForAsign);
     if (!asignResult.ok) {
       const debug = asignResult.debug;
@@ -275,7 +359,7 @@ serve(async (req) => {
         });
         const { error: rmErr } = await admin.storage.from(storageRef.bucket).remove([storageRef.path]);
         if (rmErr) {
-          console.warn("[SIGNING_DEBUG] 删除暂存 PDF 失败（可忽略）", rmErr.message);
+          console.warn("create-signing: 删除暂存 PDF 失败", rmErr.message);
         }
       }
     }
