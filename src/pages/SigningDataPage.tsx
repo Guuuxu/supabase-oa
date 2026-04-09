@@ -40,10 +40,10 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { Badge } from '@/components/ui/badge';
-import { getSigningRecords, getCompanies, getEmployees, getSignedDocuments } from '@/db/api';
+import { getSigningRecords, getCompanies, getEmployees, getSignedDocuments, downloadAsignContractAndSyncArchive } from '@/db/api';
 import type { SigningRecord, Company, Employee, SignedDocument } from '@/types/types';
 import { toast } from 'sonner';
-import { Download, Search, FileSpreadsheet, Check, ChevronsUpDown, FileText } from 'lucide-react';
+import { Download, Search, FileSpreadsheet, Check, ChevronsUpDown, FileText, CloudDownload } from 'lucide-react';
 import { Skeleton } from '@/components/ui/skeleton';
 import * as XLSX from 'xlsx';
 import { cn } from '@/lib/utils';
@@ -61,6 +61,8 @@ export default function SigningDataPage() {
   const [selectedRecord, setSelectedRecord] = useState<SigningRecord | null>(null);
   const [signedDocuments, setSignedDocuments] = useState<SignedDocument[]>([]);
   const [loadingDocuments, setLoadingDocuments] = useState(false);
+  const [syncingAsignId, setSyncingAsignId] = useState<string | null>(null);
+  const [batchSyncing, setBatchSyncing] = useState(false);
 
   // 筛选条件
   const [filters, setFilters] = useState({
@@ -217,13 +219,133 @@ export default function SigningDataPage() {
 
     try {
       const documents = await getSignedDocuments(record.id);
-      setSignedDocuments(documents);
+      if (documents.length > 0) {
+        setSignedDocuments(documents);
+      } else if (record.signed_file_url) {
+        // 兜底：若明细表暂无数据，但签署记录已保存总合同URL，仍允许查看/下载
+        setSignedDocuments([
+          {
+            id: `record-${record.id}`,
+            signing_record_id: record.id,
+            template_id: 'record_signed_contract',
+            template_name: '签署合同文件',
+            file_url: record.signed_file_url,
+            file_size: undefined,
+            signed_at: record.company_signed_at || record.employee_signed_at || record.updated_at,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+          },
+        ]);
+      } else {
+        setSignedDocuments([]);
+      }
     } catch (error) {
       console.error('获取签署文件列表失败:', error);
       toast.error('获取签署文件列表失败');
       setSignedDocuments([]);
     } finally {
       setLoadingDocuments(false);
+    }
+  };
+
+  /** 爱签 downloadContract 拉 PDF 并写入档案（与回调通知独立） */
+  const handleSyncAsignPdfToArchive = async (record: SigningRecord, force: 0 | 1) => {
+    if (!record.third_party_contract_no?.trim()) {
+      toast.error('该记录无爱签合同号');
+      return;
+    }
+    if (force === 1) {
+      const ok = confirm('确定使用强制拉取（force=1）吗？');
+      if (!ok) return;
+    }
+    setSyncingAsignId(record.id);
+    try {
+      const result = await downloadAsignContractAndSyncArchive({
+        signingRecordId: record.id,
+        force,
+      });
+      if (!result.ok) {
+        let detailStr = '';
+        if (result.detail !== undefined) {
+          if (typeof result.detail === 'string') {
+            detailStr = result.detail.slice(0, 220);
+          } else {
+            detailStr = JSON.stringify(result.detail).slice(0, 220);
+          }
+        }
+        toast.error(result.error, detailStr ? { description: detailStr } : undefined);
+        console.error('[ASIGN_SYNC] 档案页同步失败', result);
+        return;
+      }
+      toast.success(`已从爱签同步 PDF（${result.updatedRecordCount} 条相关记录）`);
+      await loadData();
+      if (selectedRecord?.id === record.id && filesDialogOpen) {
+        setLoadingDocuments(true);
+        try {
+          const documents = await getSignedDocuments(record.id);
+          setSignedDocuments(documents);
+        } finally {
+          setLoadingDocuments(false);
+        }
+      }
+    } catch (e) {
+      console.error('[ASIGN_SYNC] 档案页异常', e);
+      toast.error('同步失败');
+    } finally {
+      setSyncingAsignId(null);
+    }
+  };
+
+  /** 对当前筛选列表中「电子签 + 已完成 + 有爱签合同号」逐条拉取 PDF，避免与表格展示范围不一致 */
+  const handleBatchSync = async () => {
+    const targets = filteredRecords.filter(
+      (r) =>
+        r.status === 'completed' &&
+        r.signing_mode === 'electronic' &&
+        Boolean(r.third_party_contract_no?.trim()),
+    );
+    if (targets.length === 0) {
+      toast.error('当前列表没有可批量同步的记录（需：已完成、电子签、有爱签合同号）');
+      return;
+    }
+    setBatchSyncing(true);
+    let ok = 0;
+    let fail = 0;
+    console.log('[ASIGN_SYNC_BATCH] 开始', { count: targets.length });
+    const batchCooldownMs = 900;
+    try {
+      for (let i = 0; i < targets.length; i += 1) {
+        const record = targets[i];
+        setSyncingAsignId(record.id);
+        try {
+          const result = await downloadAsignContractAndSyncArchive({
+            signingRecordId: record.id,
+            force: 0,
+          });
+          if (result.ok) {
+            ok += 1;
+          } else {
+            fail += 1;
+            console.error('[ASIGN_SYNC_BATCH] 单条失败', record.id, result);
+          }
+        } catch (e) {
+          fail += 1;
+          console.error('[ASIGN_SYNC_BATCH] 单条异常', record.id, e);
+        } finally {
+          setSyncingAsignId(null);
+        }
+        if (i < targets.length - 1) {
+          await new Promise((r) => setTimeout(r, batchCooldownMs));
+        }
+      }
+      await loadData();
+      if (fail === 0) {
+        toast.success(`批量同步完成，共 ${ok} 条`);
+      } else {
+        toast.warning(`批量同步结束：成功 ${ok} 条，失败 ${fail} 条`);
+      }
+    } finally {
+      setBatchSyncing(false);
     }
   };
 
@@ -410,8 +532,15 @@ export default function SigningDataPage() {
         </Card>
 
         <Card>
-          <CardHeader>
+          <CardHeader className="flex items-center justify-between" style={{flexDirection: 'row'}}>
             <CardTitle>签署记录（共 {filteredRecords.length} 条）</CardTitle>
+            <Button
+              size="sm"
+              onClick={() => void handleBatchSync()}
+              disabled={batchSyncing || loading || filteredRecords.length === 0}
+            >
+              {batchSyncing ? '批量同步中…' : '批量同步'}
+            </Button>      
           </CardHeader>
           <CardContent>
             {loading ? (
@@ -467,7 +596,7 @@ export default function SigningDataPage() {
                           </TableCell>
                           <TableCell className="whitespace-nowrap">
                             {record.status === 'completed' ? (
-                              <div className="flex items-center gap-2">
+                              <div className="flex items-center gap-2 flex-wrap">
                                 <Button
                                   variant="ghost"
                                   size="sm"
@@ -476,7 +605,7 @@ export default function SigningDataPage() {
                                   <FileText className="h-4 w-4 mr-1" />
                                   查看文件
                                 </Button>
-                                {record.signed_file_url && (
+                                {/* {record.signed_file_url && (
                                   <Button
                                     variant="ghost"
                                     size="sm"
@@ -485,7 +614,30 @@ export default function SigningDataPage() {
                                     <Download className="h-4 w-4 mr-1" />
                                     下载
                                   </Button>
-                                )}
+                                )} */}
+                                {record.signing_mode === 'electronic' &&
+                                  record.third_party_contract_no && (
+                                    <>
+                                      <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        disabled={batchSyncing || syncingAsignId === record.id}
+                                        onClick={() => handleSyncAsignPdfToArchive(record, 0)}
+                                      >
+                                        <CloudDownload className="h-4 w-4 mr-1" />
+                                        {syncingAsignId === record.id ? '同步中…' : '爱签同步'}
+                                      </Button>
+                                      {/* <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        disabled={batchSyncing || syncingAsignId === record.id}
+                                        onClick={() => handleSyncAsignPdfToArchive(record, 1)}
+                                        className="text-muted-foreground"
+                                      >
+                                        强制
+                                      </Button> */}
+                                    </>
+                                  )}
                               </div>
                             ) : (
                               <span className="text-muted-foreground text-sm">-</span>
@@ -528,7 +680,33 @@ export default function SigningDataPage() {
               ) : (
                 <div className="space-y-4">
                   {/* 批量操作按钮 */}
-                  <div className="flex justify-end gap-2">
+                  <div className="flex justify-end gap-2 flex-wrap">
+                    {selectedRecord?.signing_mode === 'electronic' &&
+                      selectedRecord.third_party_contract_no && (
+                        <>
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            disabled={batchSyncing || syncingAsignId === selectedRecord.id}
+                            onClick={() =>
+                              selectedRecord && handleSyncAsignPdfToArchive(selectedRecord, 0)
+                            }
+                          >
+                            <CloudDownload className="h-4 w-4 mr-1" />
+                            {syncingAsignId === selectedRecord?.id ? '同步中…' : '从爱签同步 PDF'}
+                          </Button>
+                          {/* <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={batchSyncing || syncingAsignId === selectedRecord.id}
+                            onClick={() =>
+                              selectedRecord && handleSyncAsignPdfToArchive(selectedRecord, 1)
+                            }
+                          >
+                            强制拉取
+                          </Button> */}
+                        </>
+                      )}
                     <Button
                       variant="outline"
                       size="sm"

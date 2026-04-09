@@ -1182,6 +1182,25 @@ export async function sendSigningSMS(recordId: string): Promise<{ success: boole
 /**
  * 上传已签署文档
  */
+function normalizePublicFileUrl(rawUrl: string): string {
+  const input = String(rawUrl || '').trim();
+  if (!input) return input;
+  const base = String(import.meta.env.VITE_SUPABASE_URL || '').trim();
+  if (!base) return input;
+  if (!input.includes('://')) return input;
+  try {
+    const u = new URL(input);
+    const host = u.host.toLowerCase();
+    if (host !== 'kong:8000' && host !== 'kong' && host !== 'localhost:8000' && host !== '127.0.0.1:8000') {
+      return input;
+    }
+    const b = new URL(base);
+    return `${b.protocol}//${b.host}${u.pathname}${u.search}`;
+  } catch {
+    return input;
+  }
+}
+
 export async function uploadSignedDocument(file: File, signingRecordId: string): Promise<string | null> {
   try {
     // 生成文件名
@@ -1207,7 +1226,7 @@ export async function uploadSignedDocument(file: File, signingRecordId: string):
       .from('signed-documents')
       .getPublicUrl(filePath);
 
-    return urlData.publicUrl;
+    return normalizePublicFileUrl(urlData.publicUrl);
   } catch (error) {
     console.error('上传文件异常:', error);
     return null;
@@ -1215,19 +1234,23 @@ export async function uploadSignedDocument(file: File, signingRecordId: string):
 }
 
 /**
- * 更新签署记录的附件URL和上传信息
+ * 更新签署记录的附件URL和上传信息，并同步该记录下所有 signed_documents 的 file_url
  */
 export async function updateSigningRecordFile(
-  id: string, 
-  fileUrl: string, 
-  uploadedBy: string
+  id: string,
+  fileUrl: string,
+  uploadedBy: string,
+  fileSize?: number | null
 ): Promise<boolean> {
+  const now = new Date().toISOString();
+  const normalizedUrl = normalizePublicFileUrl(fileUrl);
+
   const { error } = await supabase
     .from('signing_records')
     .update({
-      signed_file_url: fileUrl,
-      uploaded_at: new Date().toISOString(),
-      uploaded_by: uploadedBy
+      signed_file_url: normalizedUrl,
+      uploaded_at: now,
+      uploaded_by: uploadedBy,
     })
     .eq('id', id);
 
@@ -1235,7 +1258,179 @@ export async function updateSigningRecordFile(
     console.error('更新签署记录文件失败:', error);
     return false;
   }
+
+  const docPatch: Record<string, unknown> = {
+    file_url: normalizedUrl,
+    signed_at: now,
+  };
+  if (fileSize != null && Number.isFinite(fileSize)) {
+    docPatch.file_size = Math.round(fileSize);
+  }
+
+  const { error: docError } = await supabase
+    .from('signed_documents')
+    .update(docPatch)
+    .eq('signing_record_id', id);
+
+  if (docError) {
+    console.error('同步 signed_documents 失败:', docError);
+    return false;
+  }
+
   return true;
+}
+
+/** 调用 Edge download-asign-contract：爱签 downloadContract 拉 PDF 并写入 signing_records / signed_documents */
+export type DownloadAsignContractSyncResult =
+  | { ok: true; publicUrl: string; updatedRecordCount: number; fallback?: string }
+  | { ok: false; error: string; detail?: unknown; debug?: unknown };
+
+export async function downloadAsignContractAndSyncArchive(params: {
+  signingRecordId?: string;
+  contractNo?: string;
+  force?: 0 | 1;
+}): Promise<DownloadAsignContractSyncResult> {
+  const base64ToPdfFile = (base64: string, fileName: string): File => {
+    const normalized = base64.replace(/\s/g, '');
+    const bin = atob(normalized);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i += 1) {
+      bytes[i] = bin.charCodeAt(i);
+    }
+    const blob = new Blob([bytes], { type: 'application/pdf' });
+    return new File([blob], fileName, { type: 'application/pdf' });
+  };
+  try {
+    const { data: authData } = await supabase.auth.getSession();
+    const accessToken = authData?.session?.access_token ?? '';
+    let tokenRole = '';
+    let tokenExp = '';
+    if (accessToken) {
+      const parts = accessToken.split('.');
+      if (parts.length >= 2) {
+        try {
+          const payloadJson = atob(parts[1].replace(/-/g, '+').replace(/_/g, '/'));
+          const payload = JSON.parse(payloadJson) as Record<string, unknown>;
+          const roleVal = payload.role;
+          if (typeof roleVal === 'string') {
+            tokenRole = roleVal;
+          }
+          const expVal = payload.exp;
+          if (typeof expVal === 'number') {
+            tokenExp = new Date(expVal * 1000).toISOString();
+          }
+        } catch (e) {
+          console.warn('[ASIGN_SYNC] token payload 解析失败', e);
+        }
+      }
+    }
+    console.log('[ASIGN_SYNC] invoke download-asign-contract', {
+      hasAccessToken: Boolean(accessToken),
+      tokenRole,
+      tokenExp,
+      signingRecordId: params.signingRecordId,
+      contractNo: params.contractNo,
+      force: params.force ?? 0,
+      supabaseUrl: import.meta.env.VITE_SUPABASE_URL,
+    });
+  } catch (e) {
+    console.warn('[ASIGN_SYNC] 调用前日志失败', e);
+  }
+
+  const { data, error } = await supabase.functions.invoke('download-asign-contract', {
+    body: {
+      signing_record_id: params.signingRecordId,
+      contract_no: params.contractNo,
+      force: params.force ?? 0,
+    },
+  });
+
+  if (error) {
+    console.error('[ASIGN_SYNC] invoke 失败:', {
+      name: error.name,
+      message: error.message,
+      context: (error as any).context,
+    });
+    (window as any).__LAST_ASIGN_SYNC__ = {
+      ok: false,
+      invokeError: {
+        name: error.name,
+        message: error.message,
+        context: (error as any).context,
+      },
+    };
+    return { ok: false, error: error.message };
+  }
+
+  const payload = data as Record<string, unknown> | null;
+  (window as any).__LAST_ASIGN_SYNC__ = payload;
+  console.log('[ASIGN_SYNC] invoke 返回', payload);
+  try {
+    console.log('[ASIGN_SYNC] invoke 返回完整JSON', JSON.stringify(payload ?? {}, null, 2));
+  } catch (e) {
+    console.warn('[ASIGN_SYNC] 返回JSON序列化失败', e);
+  }
+  if (payload && payload.ok === true && typeof payload.publicUrl === 'string') {
+    return {
+      ok: true,
+      publicUrl: payload.publicUrl,
+      updatedRecordCount: Number(payload.updatedRecordCount) || 0,
+      fallback: typeof payload.fallback === 'string' ? payload.fallback : undefined,
+    };
+  }
+
+  // 函数侧下载成功但服务端 storage 上传失败：回退到前端上传
+  if (
+    payload &&
+    payload.ok === true &&
+    payload.need_client_upload === true &&
+    typeof payload.pdf_base64 === 'string'
+  ) {
+    const signingRecordIdFromServer =
+      typeof payload.signing_record_id === 'string' ? payload.signing_record_id : '';
+    const effectiveSigningRecordId = signingRecordIdFromServer || params.signingRecordId || '';
+    if (!effectiveSigningRecordId) {
+      return { ok: false, error: '缺少 signingRecordId，无法执行前端上传兜底' };
+    }
+
+    const fallbackFileName =
+      typeof payload.file_name === 'string' && payload.file_name.trim()
+        ? payload.file_name.trim()
+        : `asign_${effectiveSigningRecordId}.pdf`;
+    const pdfFile = base64ToPdfFile(payload.pdf_base64, fallbackFileName);
+    const fileUrl = await uploadSignedDocument(pdfFile, effectiveSigningRecordId);
+    if (!fileUrl) {
+      return { ok: false, error: '前端上传兜底失败：上传文件失败' };
+    }
+
+    const { data: authData } = await supabase.auth.getUser();
+    const uploadedBy = authData.user?.id ?? '';
+    const syncOk = await updateSigningRecordFile(
+      effectiveSigningRecordId,
+      fileUrl,
+      uploadedBy,
+      pdfFile.size,
+    );
+    if (!syncOk) {
+      return { ok: false, error: '前端上传兜底失败：更新签署记录失败' };
+    }
+
+    return {
+      ok: true,
+      publicUrl: fileUrl,
+      updatedRecordCount: 1,
+      fallback: 'client_upload_from_base64',
+    };
+  }
+
+  const errMsg =
+    payload && typeof payload.error === 'string' ? payload.error : '爱签同步失败';
+  return {
+    ok: false,
+    error: errMsg,
+    detail: payload?.detail,
+    debug: payload?.debug,
+  };
 }
 
 // ==================== Permissions ====================

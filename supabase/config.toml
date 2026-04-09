@@ -412,6 +412,13 @@ verify_jwt = false
 import_map = "./functions/asign-notify/deno.json"
 entrypoint = "./functions/asign-notify/index.ts"
 
+# 爱签：主动 downloadContract 拉 PDF 并写入 signing_records / signed_documents（需登录）
+[functions.download-asign-contract]
+enabled = true
+verify_jwt = true
+import_map = "./functions/download-asign-contract/deno.json"
+entrypoint = "./functions/download-asign-contract/index.ts"
+
 # 管理员创建用户（service_role + auth.admin.createUser，避免前端 signUp 抢占会话）
 [functions.admin-create-user]
 enabled = true

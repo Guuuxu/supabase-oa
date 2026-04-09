@@ -491,14 +491,6 @@ export function Sidebar() {
       console.log('[JY:PERM] 未登录，无 profile');
       return;
     }
-    console.log('[JY:PERM] 当前用户摘要', {
-      id: profile.id,
-      username: profile.username,
-      role: profile.role,
-      role_id: profile.role_id,
-      isSuperAdminMenuBypass: isSuperAdmin(profile),
-    });
-    console.log('[JY:PERM] 权限 codes（getCurrentUserPermissions / role_permissions）:', userPermissions);
     const visibleMenus = navRenderSlices
       .map(({ group, visibleItems }) => ({
         title: group.title ?? '(无分组名)',
@@ -509,7 +501,6 @@ export function Sidebar() {
         })),
       }))
       .filter((g) => g.items.length > 0);
-    console.log('[JY:PERM] 可见菜单分组:', visibleMenus);
   }, [loading, profile, userPermissions, navRenderSlices]);
 
   return (

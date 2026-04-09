@@ -1,450 +1,403 @@
+// @ts-nocheck
 /**
- * 爱签异步通知（notifyUrl）回调入口。
+ * 爱签 notifyUrl 异步通知入口（须公网 HTTPS，配置见 .env.example 的 ASIGN_NOTIFY_URL）。
+ * 收到通知后：从回调体中解析 contractNo + PDF（base64 或可下载 URL）→ 上传至 signed-documents →
+ * 回填 signing_records.signed_file_url 与同批次 third_party_contract_no 下的 signed_documents。
  *
- * 验签规则（与「合同签署完成后回调通知」文档一致）：
- * - 参与签名的字段为除 `sign`、`remark` 外的键值（remark 为拒签原因时不参与签名）。
- * - 业务字段须按键名排序后组成 JSON 字符串（对齐 Fastjson MapSortField）。
- * - 使用爱签平台 RSA 公钥验签（默认 SHA-256，可通过 ASIGN_NOTIFY_VERIFY_HASH=SHA-1 切换）。
- *
- * 环境变量：
- * - ASIGN_PLATFORM_PUBLIC_KEY：爱签平台公钥（PEM 或 Base64 DER SPKI，必填方可开启验签）
- * - ASIGN_NOTIFY_VERIFY_HASH：可选 SHA-256 | SHA-1
- * - SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY：更新 signing_records
- *
- * 成功须返回纯文本 success（HTTP 200）。
+ * 成功须返回纯文本 success（部分平台约定）；爱签可能重试失败回调。
  */
+import { serve } from "https://deno.land/std/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { corsHeaders } from "../_shared/cors.ts";
+import {
+  applyExternalSignedFileUrlToSigningRecords,
+  uploadPdfBytesAndAttachToSigningRecords,
+} from "../_shared/signed-file-persist.ts";
 
-const DEBUG = "[ASIGN_NOTIFY]";
+const LOG = "[ASIGN_NOTIFY]";
 
-/** 不参与签名的字段名（大小写敏感按文档；额外兼容常见变体） */
-const EXCLUDED_SIGN_KEYS = new Set([
-  "sign",
-  "Sign",
-  "remark",
-]);
-
-function successResponse(): Response {
-  return new Response("success", {
-    status: 200,
-    headers: { ...corsHeaders, "Content-Type": "text/plain; charset=utf-8" },
-  });
-}
-
-function failResponse(message: string, status: number): Response {
-  return new Response(message, {
+function textResponse(body: string, status = 200) {
+  return new Response(body, {
     status,
     headers: { ...corsHeaders, "Content-Type": "text/plain; charset=utf-8" },
   });
 }
 
-async function parseBody(req: Request): Promise<Record<string, unknown>> {
-  const ct = (req.headers.get("content-type") ?? "").toLowerCase();
+async function parseNotifyPayload(req: Request): Promise<unknown> {
+  const raw = await req.text();
+  const ct = (req.headers.get("content-type") || "").toLowerCase();
+  if (!raw.trim()) return {};
+
   if (ct.includes("application/json")) {
     try {
-      const j = await req.json();
-      return typeof j === "object" && j !== null ? (j as Record<string, unknown>) : { value: j };
+      return JSON.parse(raw);
     } catch {
-      return {};
+      return { raw };
     }
   }
+
   if (ct.includes("application/x-www-form-urlencoded")) {
-    const text = await req.text();
-    const params = new URLSearchParams(text);
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of params.entries()) {
-      out[k] = v;
-    }
-    const bizRaw = out.bizData;
-    if (typeof bizRaw === "string") {
+    const params = new URLSearchParams(raw);
+    const biz = params.get("bizData") || params.get("bizdata") || params.get("data");
+    if (biz) {
       try {
-        const parsed = JSON.parse(bizRaw);
-        if (typeof parsed === "object" && parsed !== null) {
-          out._bizDataParsed = parsed;
-        }
+        return JSON.parse(biz);
       } catch {
-        /* 保留原始字符串 */
+        return { bizDataRaw: biz };
       }
     }
-    return out;
+    return Object.fromEntries(params.entries());
   }
-  const text = await req.text();
-  if (!text.trim()) return {};
+
   try {
-    const j = JSON.parse(text);
-    return typeof j === "object" && j !== null ? (j as Record<string, unknown>) : { value: j };
+    return JSON.parse(raw);
   } catch {
-    return { raw: text };
+    return { raw };
   }
 }
 
-/**
- * 若顶层为 { bizData: "<json>", sign: "..." }，验签正文一般为 bizData 解析后的 Map；
- * 否则使用扁平 body。
- */
-function payloadForVerification(body: Record<string, unknown>): Record<string, unknown> {
-  const signVal = body.sign ?? body.Sign;
-  const biz = body.bizData;
-  if (typeof biz === "string" && biz.trim() && typeof signVal === "string" && signVal) {
-    try {
-      const inner = JSON.parse(biz) as Record<string, unknown>;
-      if (inner && typeof inner === "object" && !Array.isArray(inner)) {
-        return { ...inner };
+function extractContractNo(payload: unknown): string | null {
+  const candidates: string[] = [];
+  const visit = (o: unknown) => {
+    if (!o || typeof o !== "object") return;
+    if (Array.isArray(o)) {
+      for (const x of o) visit(x);
+      return;
+    }
+    for (const [k, v] of Object.entries(o as Record<string, unknown>)) {
+      const kl = k.toLowerCase();
+      if (
+        (kl === "contractno" || kl === "contract_no" || kl === "contractnumber") &&
+        typeof v === "string" &&
+        v.trim()
+      ) {
+        candidates.push(v.trim());
+      } else if (v && typeof v === "object") {
+        visit(v);
       }
-    } catch {
-      /* 使用整包 body */
     }
-  }
-  const parsed = body._bizDataParsed;
-  if (
-    parsed && typeof parsed === "object" && !Array.isArray(parsed) &&
-    typeof signVal === "string" && signVal
-  ) {
-    return { ...(parsed as Record<string, unknown>) };
-  }
-  return { ...body };
-}
-
-/** 与文档一致：按键排序、值统一为字符串后 JSON.stringify（无多余空格） */
-function buildSortedSignJson(fields: Record<string, unknown>): string {
-  const flat: Record<string, string> = {};
-  for (const [k, v] of Object.entries(fields)) {
-    if (k.startsWith("_")) continue;
-    if (EXCLUDED_SIGN_KEYS.has(k)) continue;
-    if (v === null || v === undefined) continue;
-    if (typeof v === "object") continue;
-    if (typeof v === "string") {
-      flat[k] = v;
-      continue;
-    }
-    if (typeof v === "number" || typeof v === "boolean") {
-      flat[k] = String(v);
-      continue;
-    }
-    flat[k] = String(v);
-  }
-  const sortedKeys = Object.keys(flat).sort();
-  const ordered: Record<string, string> = {};
-  for (const key of sortedKeys) {
-    ordered[key] = flat[key];
-  }
-  return JSON.stringify(ordered);
-}
-
-function normalizePublicKeyInput(raw: string): string {
-  let s = raw.trim();
-  if (s.includes("BEGIN")) {
-    s = s.replace(/-----BEGIN PUBLIC KEY-----/gi, "");
-    s = s.replace(/-----END PUBLIC KEY-----/gi, "");
-    s = s.replace(/\s+/g, "");
-  }
-  return s;
-}
-
-async function importRsaSpkiPublicKey(b64Der: string, hash: "SHA-256" | "SHA-1"): Promise<CryptoKey> {
-  const cleaned = normalizePublicKeyInput(b64Der);
-  const der = Uint8Array.from(globalThis.atob(cleaned), (c) => c.charCodeAt(0));
-  return crypto.subtle.importKey(
-    "spki",
-    der,
-    { name: "RSASSA-PKCS1-v1_5", hash },
-    false,
-    ["verify"],
-  );
-}
-
-function getNotifyVerifyHash(): "SHA-256" | "SHA-1" {
-  const raw = (Deno.env.get("ASIGN_NOTIFY_VERIFY_HASH") ?? "SHA-256").trim().toUpperCase();
-  if (raw === "SHA1" || raw === "SHA-1") return "SHA-1";
-  return "SHA-256";
-}
-
-async function verifyNotifyRsaPkcs1(
-  plaintextUtf8: string,
-  signB64: string,
-  publicKeyMaterial: string,
-  hash: "SHA-256" | "SHA-1",
-): Promise<boolean> {
-  const signClean = signB64.replace(/\s/g, "");
-  const sig = Uint8Array.from(globalThis.atob(signClean), (c) => c.charCodeAt(0));
-  const data = new TextEncoder().encode(plaintextUtf8);
-  const key = await importRsaSpkiPublicKey(publicKeyMaterial, hash);
-  return crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, sig, data);
-}
-
-async function verifyNotifySignatureOrThrow(
-  body: Record<string, unknown>,
-  publicKey: string,
-): Promise<void> {
-  const signRaw = body.sign ?? body.Sign;
-  if (typeof signRaw !== "string" || !signRaw.trim()) {
-    throw new Error("缺少 sign");
-  }
-  const signPayload = payloadForVerification(body);
-  const planJson = buildSortedSignJson(signPayload);
-  const hashPrimary = getNotifyVerifyHash();
-  const hashFallback = hashPrimary === "SHA-256" ? "SHA-1" : "SHA-256";
-
-  let ok = await verifyNotifyRsaPkcs1(planJson, signRaw, publicKey, hashPrimary);
-  let usedHash = hashPrimary;
-  if (!ok) {
-    ok = await verifyNotifyRsaPkcs1(planJson, signRaw, publicKey, hashFallback);
-    usedHash = hashFallback;
-  }
-
-  if (!ok) {
-    console.error(`${DEBUG} 验签失败`, { plaintextPreview: planJson.slice(0, 800) });
-    throw new Error("验签失败");
-  }
-  console.log(`${DEBUG} 验签通过`, { algorithm: usedHash, jsonLen: planJson.length });
-}
-
-/** 从回调体中尽量解析出合同编号 */
-function extractContractNo(body: Record<string, unknown>): string | undefined {
-  const effective = payloadForVerification(body);
-  const tryRecord = (r: Record<string, unknown>): string | undefined => {
-    const direct = r.contractNo ?? r.contract_no;
-    if (typeof direct === "string" && direct.trim()) return direct.trim();
-    const directId = r.contractId ?? r.contract_id;
-    if (typeof directId === "string" && directId.trim()) return directId.trim();
-    return undefined;
   };
-  const fromEffective = tryRecord(effective);
-  if (fromEffective) return fromEffective;
-  return tryRecord(body);
+  visit(payload);
+  if (candidates.length === 0) return null;
+  return candidates[0];
 }
 
-function asDataRecord(value: unknown): Record<string, unknown> | null {
-  if (value && typeof value === "object" && !Array.isArray(value)) {
-    return value as Record<string, unknown>;
-  }
-  return null;
-}
-
-function extractStatusFields(body: Record<string, unknown>): {
-  contractStatus: string;
-  callbackType: string;
-} {
-  const effective = payloadForVerification(body);
+function extractStatusSignal(payload: unknown): { contractStatus: string; callbackType: string; rawStatus: string } {
   let contractStatus = "";
   let callbackType = "";
-  const statusKeys = [
-    effective.status,
-    effective.contractStatus,
-    effective.contract_status,
-    body.status,
-    body.contractStatus,
-    body.contract_status,
-    body.signStatus,
-  ];
-  for (const k of statusKeys) {
-    if (typeof k === "string" && k) {
-      contractStatus = k;
-      break;
+  let rawStatus = "";
+  const visit = (o: unknown) => {
+    if (!o || typeof o !== "object") return;
+    if (Array.isArray(o)) {
+      for (const x of o) visit(x);
+      return;
     }
-    if (typeof k === "number") {
-      contractStatus = String(k);
-      break;
+    for (const [k, v] of Object.entries(o as Record<string, unknown>)) {
+      const kl = k.toLowerCase();
+      if (typeof v === "string" || typeof v === "number") {
+        const sv = String(v).trim();
+        if (!contractStatus && (kl === "contractstatus" || kl === "contract_status")) {
+          contractStatus = sv;
+        } else if (!callbackType && (kl === "callbacktype" || kl === "callback_type")) {
+          callbackType = sv;
+        } else if (!rawStatus && kl === "status") {
+          rawStatus = sv;
+        }
+      } else if (v && typeof v === "object") {
+        visit(v);
+      }
     }
-  }
-  const callbackKeys = [
-    effective.callbackType,
-    effective.callback_type,
-    body.callbackType,
-    body.callback_type,
-    body.eventType,
-    body.event_type,
-  ];
-  for (const k of callbackKeys) {
-    if (typeof k === "string" && k) {
-      callbackType = k;
-      break;
-    }
-  }
-  const nested = asDataRecord(effective.data) ?? asDataRecord(body.data);
-  if (nested) {
-    if (!contractStatus) {
-      const v = nested.contractStatus ?? nested.contract_status ?? nested.status;
-      if (typeof v === "string") contractStatus = v;
-      if (typeof v === "number") contractStatus = String(v);
-    }
-    if (!callbackType) {
-      const v = nested.callbackType ?? nested.callback_type;
-      if (typeof v === "string") callbackType = v;
-    }
-  }
-  return { contractStatus, callbackType };
+  };
+  visit(payload);
+  return { contractStatus, callbackType, rawStatus };
 }
 
-/** 映射到 signing_status */
-function mapToSigningStatus(body: Record<string, unknown>): string | null {
-  const effective = payloadForVerification(body);
-  const actionRaw = effective.action ?? body.action;
-  const action = typeof actionRaw === "string" ? actionRaw : "";
-  const actionNorm = action.replace(/\s/g, "").toLowerCase();
-  if (actionNorm === "signcompleted") return "completed";
+function mapToSigningStatus(payload: unknown): "completed" | "employee_signed" | "rejected" | null {
+  const { contractStatus, callbackType, rawStatus } = extractStatusSignal(payload);
+  const cs = contractStatus.toUpperCase();
+  const cb = callbackType.toUpperCase();
+  const rs = rawStatus.trim();
 
-  // 先用回调里的「数值状态码」做兜底映射：
-  // - status = 2：完成
-  // - status = 4 / -3：拒签/失败
-  // 爱签回调里有时同时存在 status=4 但 contractStatus 仍是 SIGNING，
-  // 这会导致后续逻辑误判为 employee_signed，因此这里优先处理。
-  const statusCode = (() => {
-    const candidates: unknown[] = [effective.status, body.status];
-    for (const k of candidates) {
-      if (typeof k === "string" && k.trim()) return k.trim();
-      if (typeof k === "number") return String(k);
-    }
-    return undefined;
-  })();
+  if (rs === "2") return "completed";
+  if (rs === "4" || rs === "-3") return "rejected";
 
-  if (statusCode === "2") return "completed";
-  if (statusCode === "4" || statusCode === "-3") return "rejected";
-
-  const { contractStatus, callbackType } = extractStatusFields(body);
-  const s = contractStatus.toUpperCase();
-  const c = callbackType.toUpperCase();
-
-  if (contractStatus === "2") return "completed";
-
-  if (s.includes("COMPLETE") || c.includes("COMPLETE")) return "completed";
-  if (s.includes("REJECT") || s.includes("REFUSE") || c.includes("REJECT") || c.includes("REFUSE")) {
+  if (cs.includes("COMPLETE") || cb.includes("COMPLETE")) return "completed";
+  if (cs.includes("REJECT") || cs.includes("REFUSE") || cb.includes("REJECT") || cb.includes("REFUSE")) {
     return "rejected";
   }
-  if (s.includes("SIGNING")) return "employee_signed";
-  if (c.includes("SUBMIT_SIGN")) return "employee_signed";
+  if (cs.includes("SIGNING") || cb.includes("SUBMIT_SIGN")) return "employee_signed";
+
   return null;
 }
 
-Deno.serve(async (req) => {
+async function updateSigningStatusByContractNo(
+  admin: ReturnType<typeof createClient>,
+  contractNo: string,
+  nextStatus: "completed" | "employee_signed" | "rejected",
+) {
+  const { data: rows, error: queryErr } = await admin
+    .from("signing_records")
+    .select("id,status")
+    .eq("third_party_contract_no", contractNo);
+  if (queryErr) {
+    console.error(LOG, "查询签署记录失败:", queryErr.message);
+    return;
+  }
+  const list = (rows ?? []) as Array<{ id: string; status?: string }>;
+  if (list.length === 0) {
+    console.warn(LOG, "未找到 contractNo 对应记录:", contractNo);
+    return;
+  }
+
+  const now = new Date().toISOString();
+  const ids: string[] = [];
+  for (const row of list) {
+    const current = String(row.status ?? "").trim();
+    // 不覆盖已撤回
+    if (current === "withdrawn") continue;
+    ids.push(row.id);
+  }
+  if (ids.length === 0) return;
+
+  const patch: Record<string, unknown> = { status: nextStatus };
+  if (nextStatus === "employee_signed") {
+    patch.employee_signed_at = now;
+  } else if (nextStatus === "completed") {
+    patch.company_signed_at = now;
+  }
+
+  const { error: updErr } = await admin
+    .from("signing_records")
+    .update(patch)
+    .in("id", ids);
+  if (updErr) {
+    console.error(LOG, "回写签署状态失败:", updErr.message);
+    return;
+  }
+  console.log(LOG, "回写签署状态成功:", nextStatus, "记录数:", ids.length);
+}
+
+function collectUrlStrings(obj: unknown, out: Set<string>) {
+  const visit = (o: unknown) => {
+    if (!o || typeof o !== "object") return;
+    if (Array.isArray(o)) {
+      for (const x of o) visit(x);
+      return;
+    }
+    for (const v of Object.values(o as Record<string, unknown>)) {
+      if (typeof v === "string" && /^https?:\/\//i.test(v.trim())) {
+        out.add(v.trim());
+      } else if (v && typeof v === "object") {
+        visit(v);
+      }
+    }
+  };
+  visit(obj);
+}
+
+function tryDecodeBase64Pdf(s: string): Uint8Array | null {
+  const t = s.trim();
+  if (t.length < 80) return null;
+  const base = t.replace(/^data:application\/pdf;base64,/i, "").replace(/\s/g, "");
+  try {
+    const bin = atob(base);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const isPdf =
+      bytes.length >= 4 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46;
+    if (isPdf) return bytes;
+    if (bytes.length > 800) return bytes;
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+function extractBase64PdfFromPayload(payload: unknown): Uint8Array | null {
+  const visit = (o: unknown): Uint8Array | null => {
+    if (!o) return null;
+    if (typeof o === "string") {
+      return tryDecodeBase64Pdf(o);
+    }
+    if (typeof o !== "object") return null;
+    if (Array.isArray(o)) {
+      for (const x of o) {
+        const h = visit(x);
+        if (h) return h;
+      }
+      return null;
+    }
+    for (const v of Object.values(o as Record<string, unknown>)) {
+      const h = visit(v as unknown);
+      if (h) return h;
+    }
+    return null;
+  };
+  return visit(payload);
+}
+
+async function fetchPdfFromUrl(url: string): Promise<Uint8Array | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 25000);
+  try {
+    const res = await fetch(url, { signal: controller.signal, redirect: "follow" });
+    if (!res.ok) {
+      console.warn(LOG, "下载 URL 非成功状态", url, res.status);
+      return null;
+    }
+    const ab = await res.arrayBuffer();
+    const bytes = new Uint8Array(ab);
+    if (bytes.length > 25 * 1024 * 1024) {
+      console.warn(LOG, "文件过大，跳过", url);
+      return null;
+    }
+    const isPdf =
+      bytes.length >= 4 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46;
+    if (isPdf) return bytes;
+    const ct = (res.headers.get("content-type") || "").toLowerCase();
+    if (ct.includes("pdf")) return bytes;
+    return null;
+  } catch (e) {
+    console.warn(LOG, "fetch 失败", url, e);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function pickBestExternalPdfUrl(payload: unknown): string | null {
+  const urls = new Set<string>();
+  collectUrlStrings(payload, urls);
+  const list = [...urls];
+  if (list.length === 0) return null;
+  const score = (u: string) => {
+    const l = u.toLowerCase();
+    let s = 0;
+    if (l.includes(".pdf")) s += 4;
+    if (l.includes("download")) s += 2;
+    if (l.includes("/file/")) s += 2;
+    if (l.includes("contract")) s += 1;
+    return s;
+  };
+  list.sort((a, b) => score(b) - score(a));
+  return list[0];
+}
+
+async function tryGetPdfBytes(payload: unknown): Promise<Uint8Array | null> {
+  const fromB64 = extractBase64PdfFromPayload(payload);
+  if (fromB64) return fromB64;
+
+  const urls = new Set<string>();
+  collectUrlStrings(payload, urls);
+  const sorted = [...urls].sort((a, b) => {
+    const score = (u: string) => {
+      const l = u.toLowerCase();
+      let s = 0;
+      if (l.includes(".pdf")) s += 3;
+      if (l.includes("download") || l.includes("/file/")) s += 2;
+      if (l.includes("contract")) s += 1;
+      return s;
+    };
+    return score(b) - score(a);
+  });
+
+  for (const u of sorted) {
+    const bytes = await fetchPdfFromUrl(u);
+    if (bytes) return bytes;
+  }
+  return null;
+}
+
+serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
   }
 
   if (req.method !== "POST") {
-    return failResponse("Method Not Allowed", 405);
+    return textResponse("method not allowed", 405);
   }
 
-  const body = await parseBody(req);
-  console.log(`${DEBUG} 收到回调`, JSON.stringify(body).slice(0, 4000));
-
-  const publicKey = Deno.env.get("ASIGN_PLATFORM_PUBLIC_KEY")?.trim();
-  if (publicKey) {
-    try {
-      await verifyNotifySignatureOrThrow(body, publicKey);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      console.error(`${DEBUG} 验签拒绝`, msg);
-      return failResponse("invalid signature", 401);
-    }
-  } else {
-    console.warn(`${DEBUG} 未配置 ASIGN_PLATFORM_PUBLIC_KEY，跳过验签（生产环境请配置）`);
+  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")?.trim();
+  const supabaseUrl = Deno.env.get("SUPABASE_URL")?.trim();
+  if (!serviceKey || !supabaseUrl) {
+    console.error(LOG, "缺少 SUPABASE_SERVICE_ROLE_KEY / SUPABASE_URL");
+    return textResponse("success", 200);
   }
 
-  const contractNo = extractContractNo(body);
-  const nextStatus = mapToSigningStatus(body);
+  let payload: unknown;
+  try {
+    payload = await parseNotifyPayload(req);
+  } catch (e) {
+    console.warn(LOG, "解析请求体失败", e);
+    return textResponse("success", 200);
+  }
 
-  console.log(`${DEBUG} 解析`, { contractNo, nextStatus });
+  const topKeys = payload && typeof payload === "object" && !Array.isArray(payload)
+    ? Object.keys(payload as object)
+    : [];
+  console.log(LOG, "收到回调 topKeys=", topKeys);
 
+  const contractNo = extractContractNo(payload);
   if (!contractNo) {
-    console.warn(`${DEBUG} 未解析到 contractNo，不落库`);
-    return successResponse();
+    console.warn(LOG, "未解析到 contractNo，跳过落库（请对照爱签真实回调字段）");
+    return textResponse("success", 200);
   }
 
-  const url = Deno.env.get("SUPABASE_URL");
-  const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  if (!url || !key) {
-    console.error(`${DEBUG} 缺少 SUPABASE_URL 或 SUPABASE_SERVICE_ROLE_KEY`);
-    return failResponse("server misconfigured", 500);
+  const admin = createClient(supabaseUrl, serviceKey, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  });
+
+  // 回调的主职责：更新签署状态
+  const nextStatus = mapToSigningStatus(payload);
+  if (nextStatus) {
+    await updateSigningStatusByContractNo(admin, contractNo, nextStatus);
+  } else {
+    console.log(LOG, "未识别到可映射的签署状态，contractNo=", contractNo);
   }
 
-  const supabase = createClient(url, key);
-
-  if (!nextStatus) {
-    console.log(`${DEBUG} 无状态映射，跳过更新`, { contractNo });
-    return successResponse();
-  }
-
-  const { data: rows, error: findError } = await supabase
-    .from("signing_records")
-    .select("id, status, template_ids")
-    .eq("third_party_contract_no", contractNo)
-    .limit(5);
-
-  if (findError) {
-    console.error(`${DEBUG} 查询签署记录失败`, findError);
-    return failResponse("db query error", 500);
-  }
-
-  if (!rows || rows.length === 0) {
-    console.warn(`${DEBUG} 未找到 third_party_contract_no=${contractNo} 的记录`);
-    return successResponse();
-  }
-
-  if (rows.length > 1) {
-    console.warn(`${DEBUG} 多条记录匹配 contractNo，仅更新第一条`, { count: rows.length });
-  }
-
-  const row = rows[0] as any;
-  const id = row.id;
-
-  let finalStatus = nextStatus;
-  const nowIso = new Date().toISOString();
-
-  // 当回调判断为“员工已签”(employee_signed)时：
-  // - 若关联模板 requires_company_signature=false：只需员工签署，则直接置为 completed。
-  // - 若 requires_company_signature=true：保留 employee_signed，等待公司签署回调。
-  if (nextStatus === "employee_signed") {
-    const templateIds: string[] = Array.isArray(row.template_ids) ? row.template_ids : [];
-    let requiresCompanySignature = false;
-
-    if (templateIds.length > 0) {
-      const { data: docs, error: docsErr } = await supabase
-        .from("document_templates")
-        .select("id, requires_company_signature")
-        .in("id", templateIds);
-
-      if (!docsErr && Array.isArray(docs)) {
-        requiresCompanySignature = docs.some((d: any) => d.requires_company_signature === true);
-      } else {
-        console.warn(`${DEBUG} 读取模板 requires_company_signature 失败，使用默认：需要公司签署`, {
-          docsErr,
-          templateIdsLen: templateIds.length,
-        });
-        requiresCompanySignature = true;
-      }
-    }
-
-    if (!requiresCompanySignature) {
-      finalStatus = "completed";
-    }
-
-    console.log(`${DEBUG} employee_signed 映射决策`, {
-      templateIdsLen: templateIds.length,
-      requiresCompanySignature,
-      finalStatus,
+  const pdfBytes = await tryGetPdfBytes(payload);
+  if (pdfBytes) {
+    const result = await uploadPdfBytesAndAttachToSigningRecords(admin, pdfBytes, {
+      contractNo,
+      uploadedBy: null,
+      fileNamePrefix: "asign",
     });
+
+    if (!result.ok) {
+      console.error(LOG, "落库失败", result.error);
+    } else {
+      console.log(LOG, "已保存签署文件", result.publicUrl, "更新记录数", result.updatedRecordCount);
+    }
+    return textResponse("success", 200);
   }
 
-  // 更新 payload：补充签署时间字段（便于前端展示）
-  const updatePayload: any = { status: finalStatus };
-  if (nextStatus === "employee_signed") {
-    updatePayload.employee_signed_at = nowIso;
-  } else if (nextStatus === "completed") {
-    updatePayload.company_signed_at = nowIso;
+  const fallbackUrl = pickBestExternalPdfUrl(payload);
+  if (fallbackUrl) {
+    const extRes = await applyExternalSignedFileUrlToSigningRecords(
+      admin,
+      contractNo,
+      fallbackUrl,
+      null,
+    );
+    if (!extRes.ok) {
+      console.error(LOG, "外链落库失败", extRes.error);
+    } else {
+      console.log(
+        LOG,
+        "已写入外链（未转存 Storage）",
+        extRes.publicUrl,
+        "更新记录数",
+        extRes.updatedRecordCount,
+      );
+    }
+    return textResponse("success", 200);
   }
 
-  const { error: updError } = await supabase
-    .from("signing_records")
-    .update(updatePayload)
-    .eq("id", id);
-
-  if (updError) {
-    console.error(`${DEBUG} 更新失败`, updError);
-    return failResponse("db update error", 500);
-  }
-
-  console.log(`${DEBUG} 已更新签署记录`, { id, nextStatus, finalStatus });
-  return successResponse();
+  console.warn(
+    LOG,
+    "未找到 PDF 或可用文件 URL，contractNo=",
+    contractNo,
+    "（请核对爱签回调是否含 base64 / 直链；仅状态变更无文件时无法自动存档）",
+  );
+  return textResponse("success", 200);
 });

@@ -55,6 +55,7 @@ import {
 } from '@/components/ui/accordion';
 import { 
   getSigningRecords, 
+  getSigningRecord,
   getCompanies, 
   getEmployees, 
   getDocumentTemplates,
@@ -62,6 +63,7 @@ import {
   updateSigningRecord,
   uploadSignedDocument,
   updateSigningRecordFile,
+  downloadAsignContractAndSyncArchive,
   addAsignSignatory,
   type AsignAddSignerItem,
   type AsignSignStrategyItem,
@@ -69,7 +71,7 @@ import {
 import { SIGNING_STATUS_LABELS, DOCUMENT_CATEGORY_LABELS, DOCUMENT_CATEGORY_LABELS_WITH_UNIVERSAL } from '@/types/types';
 import type { SigningRecord, Company, Employee, DocumentTemplate, SigningStatus, SigningMode, DocumentCategory, DocumentCategoryWithUniversal } from '@/types/types';
 import { toast } from 'sonner';
-import { Plus, Eye, Check, ChevronsUpDown, Download, FileText, X, Search } from 'lucide-react';
+import { Plus, Eye, Check, ChevronsUpDown, Download, FileText, X, Search, CloudDownload } from 'lucide-react';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useAuth } from '@/contexts/AuthContext';
 import { cn } from '@/lib/utils';
@@ -91,6 +93,7 @@ export default function SigningsPage() {
   const [statusFilter, setStatusFilter] = useState<string>('');
   const [searchKeyword, setSearchKeyword] = useState<string>(''); // 搜索关键词
   const [uploading, setUploading] = useState(false);
+  const [syncingAsignPdf, setSyncingAsignPdf] = useState(false);
   const [previewDialogOpen, setPreviewDialogOpen] = useState(false);
   const [previewFileUrl, setPreviewFileUrl] = useState<string>('');
   const [previewFileType, setPreviewFileType] = useState<'pdf' | 'image'>('pdf');
@@ -2948,7 +2951,12 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
       }
 
       // 更新签署记录
-      const success = await updateSigningRecordFile(signingId, fileUrl, (profile?.id as string) || '');
+      const success = await updateSigningRecordFile(
+        signingId,
+        fileUrl,
+        (profile?.id as string) || '',
+        file.size,
+      );
       if (success) {
         toast.success('上传成功');
         loadData();
@@ -2961,6 +2969,57 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
       toast.error('上传文件失败');
     } finally {
       setUploading(false);
+    }
+  };
+
+  /** 爱签 downloadContract → Storage → signing_records / signed_documents（与 notify 回调无关） */
+  const handlePullAsignContractPdf = async (signing: SigningRecord, force: 0 | 1) => {
+    if (!signing.third_party_contract_no?.trim()) {
+      toast.error('该记录无爱签合同号，无法从爱签下载');
+      return;
+    }
+    if (signing.status !== 'completed') {
+      toast.error('签署未完成（未入库）时禁止同步，请待状态为已完成后再操作');
+      return;
+    }
+    if (force === 1) {
+      const confirmed = confirm(
+        '强制拉取（force=1）：适用于爱签侧状态与本地不一致等场景。确定继续吗？',
+      );
+      if (!confirmed) return;
+    }
+    setSyncingAsignPdf(true);
+    try {
+      const result = await downloadAsignContractAndSyncArchive({
+        signingRecordId: signing.id,
+        force,
+      });
+      if (!result.ok) {
+        let detailStr = '';
+        if (result.detail !== undefined) {
+          if (typeof result.detail === 'string') {
+            detailStr = result.detail.slice(0, 220);
+          } else {
+            detailStr = JSON.stringify(result.detail).slice(0, 220);
+          }
+        }
+        toast.error(result.error, detailStr ? { description: detailStr } : undefined);
+        console.error('[ASIGN_SYNC] 拉取失败', result);
+        return;
+      }
+      toast.success(
+        `已从爱签同步 PDF，共更新 ${result.updatedRecordCount} 条相关签署档案`,
+      );
+      await loadData();
+      const fresh = await getSigningRecord(signing.id);
+      if (fresh) {
+        setSelectedSigning(fresh);
+      }
+    } catch (e) {
+      console.error('[ASIGN_SYNC] 异常', e);
+      toast.error('同步失败');
+    } finally {
+      setSyncingAsignPdf(false);
     }
   };
 
@@ -4257,6 +4316,41 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                     <p className="mt-1">{selectedSigning.notes}</p>
                   </div>
                 )}
+
+                {selectedSigning.signing_mode === 'electronic' &&
+                  selectedSigning.status === 'completed' &&
+                  selectedSigning.third_party_contract_no && (
+                    <div className="border-t pt-4 space-y-2">
+                      <Label className="text-muted-foreground">爱签档案同步</Label>
+                      <p className="text-sm text-muted-foreground">
+                        调用下载合同接口将 PDF 写入档案表与 Storage（不影响异步回调逻辑，可作补拉）。
+                      </p>
+                      <div className="flex flex-wrap gap-2 items-center">
+                        <Button
+                          type="button"
+                          variant="secondary"
+                          size="sm"
+                          disabled={syncingAsignPdf}
+                          onClick={() => handlePullAsignContractPdf(selectedSigning, 0)}
+                        >
+                          <CloudDownload className="h-4 w-4 mr-1" />
+                          {syncingAsignPdf ? '同步中…' : '从爱签同步 PDF'}
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          disabled={syncingAsignPdf}
+                          onClick={() => handlePullAsignContractPdf(selectedSigning, 1)}
+                        >
+                          强制拉取
+                        </Button>
+                        <span className="text-xs text-muted-foreground font-mono break-all">
+                          {selectedSigning.third_party_contract_no}
+                        </span>
+                      </div>
+                    </div>
+                  )}
                 
                 {/* 线下签署模式：显示上传附件功能 */}
                 {selectedSigning.signing_mode === 'offline' && selectedSigning.status === 'pending' && (

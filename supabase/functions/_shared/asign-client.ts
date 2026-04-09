@@ -714,3 +714,409 @@ export async function callAsignFormPost(args: CallAsignFormPostArgs) {
 
   return lastFailure ?? { ok: false as const, status: 500, data: { msg: "unknown failure" } };
 }
+
+function isPdfMagic(bytes: Uint8Array): boolean {
+  return bytes.length >= 5 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46;
+}
+
+/** 从爱签 JSON 响应中查找可能是 PDF 的 base64 字段 */
+function findLongBase64InObject(obj: unknown, depth = 0): string | null {
+  if (depth > 14) return null;
+  if (typeof obj === "string") {
+    let s = obj.trim();
+    const dataPrefix = /^data:application\/pdf;base64,/i;
+    if (dataPrefix.test(s)) {
+      s = s.replace(dataPrefix, "");
+    }
+    if (s.length < 80) return null;
+    const compact = s.replace(/\s/g, "");
+    if (!/^[A-Za-z0-9+/=_-]+$/.test(compact)) return null;
+    try {
+      const decoded = base64ToBytes(compact);
+      if (isPdfMagic(decoded)) return compact;
+      if (decoded.length > 800) return compact;
+    } catch {
+      return null;
+    }
+    return null;
+  }
+  if (!obj || typeof obj !== "object") return null;
+  if (Array.isArray(obj)) {
+    for (const x of obj) {
+      const h = findLongBase64InObject(x, depth + 1);
+      if (h) return h;
+    }
+    return null;
+  }
+  for (const v of Object.values(obj as Record<string, unknown>)) {
+    const h = findLongBase64InObject(v, depth + 1);
+    if (h) return h;
+  }
+  return null;
+}
+
+export type AsignDownloadContractResult =
+  | { ok: true; bytes: Uint8Array }
+  | { ok: false; status: number; data: unknown; debug?: unknown };
+
+/**
+ * 爱签「下载合同」contract/downloadContract：bizData 含 contractNo、downloadFileType（1=PDF）、force（0|1）。
+ * 响应可能是 **原始 PDF 二进制**，或 JSON（含业务错误 / base64 文件）。
+ * 路径可通过 ASIGN_DOWNLOAD_CONTRACT_PATH 覆盖（默认 contract/downloadContract）。
+ * 超时单独使用 ASIGN_DOWNLOAD_TIMEOUT_MS（默认 60000），避免大文件被默认 8s 切断。
+ */
+export async function callAsignDownloadContract(args: {
+  contractNo: string;
+  force?: number;
+  downloadFileType?: number;
+}): Promise<AsignDownloadContractResult> {
+  const pathClean = (Deno.env.get("ASIGN_DOWNLOAD_CONTRACT_PATH") ?? "contract/downloadContract")
+    .trim()
+    .replace(/^\/+/, "");
+  const url = `${getAsignBaseUrl()}/${pathClean}`;
+
+  const appId = Deno.env.get("ASIGN_APP_ID")?.trim() || "997407968";
+  if (!appId) {
+    return { ok: false, status: 500, data: { code: "LOCAL_MISSING_APP_ID", msg: "缺少环境变量 ASIGN_APP_ID" } };
+  }
+
+  const keepEmpty: string[] = [];
+  const bizDataOrder = getAsignBizDataOrder();
+  const deepSortRaw = (Deno.env.get("ASIGN_BIZDATA_DEEP_SORT_KEYS") ?? "1").trim();
+  const useDeepSort = deepSortRaw !== "0" && deepSortRaw.toLowerCase() !== "false";
+
+  const rawInput: Record<string, unknown> = {
+    contractNo: String(args.contractNo).trim(),
+    force: args.force ?? 0,
+    downloadFileType: args.downloadFileType ?? 1,
+  };
+
+  let bizDataForSign: Record<string, unknown>;
+  if (bizDataOrder === "unsorted") {
+    bizDataForSign = filterObjectKeepOrder({ ...rawInput }, { keepEmptyStringKeys: keepEmpty });
+  } else {
+    bizDataForSign = sortAndFilterObject({ ...rawInput }, { keepEmptyStringKeys: keepEmpty });
+  }
+  const bizDataForJson = useDeepSort
+    ? (deepSortJsonKeys(bizDataForSign) as Record<string, unknown>)
+    : bizDataForSign;
+  const bizDataJson = JSON.stringify(bizDataForJson);
+  const strictBase = bizDataRecordLikeNodeDemoGeneric({ ...rawInput });
+  const strictForJson = useDeepSort
+    ? (deepSortJsonKeys(strictBase) as Record<string, unknown>)
+    : strictBase;
+  const bizDataJsonStrict = JSON.stringify(strictForJson);
+  const bizData = bizDataForJson;
+
+  const timestampSec = String(Math.floor(Date.now() / 1000));
+
+  const envHash = getAsignSignHash();
+  const envMode = getAsignSignPlaintextMode();
+
+  const attempts: AsignAttemptSpec[] = [
+    {
+      tag: "primary_sec",
+      timestamp: timestampSec,
+      timestampMode: "static",
+      signHash: envHash,
+      signPlaintextMode: envMode,
+    },
+    {
+      tag: "official_node_sha1_plus600_strictjson_signonly",
+      timestamp: "",
+      timestampMode: "ms_plus_600",
+      signHash: "SHA-1",
+      signPlaintextMode: "official_concat",
+      useOfficialBizJson: true,
+      headerMode: "sign_only",
+    },
+    {
+      tag: "official_node_sha1_plus600_relaxedjson_fullheaders",
+      timestamp: "",
+      timestampMode: "ms_plus_600",
+      signHash: "SHA-1",
+      signPlaintextMode: "official_concat",
+      useOfficialBizJson: false,
+      headerMode: "full",
+    },
+  ];
+
+  const maxNoFilesRaw = (Deno.env.get("ASIGN_DOWNLOAD_MAX_ATTEMPTS") ?? "4").trim();
+  const maxNoFiles = Math.max(1, parseInt(maxNoFilesRaw, 10) || 4);
+  const attemptsEffective = attempts.slice(0, Math.min(attempts.length, maxNoFiles));
+
+  const timeoutMsRaw = (Deno.env.get("ASIGN_DOWNLOAD_TIMEOUT_MS") ?? "60000").trim();
+  const timeoutMs = Math.max(5000, parseInt(timeoutMsRaw, 10) || 60000);
+
+  let lastFailure: { ok: false; status: number; data: unknown; debug?: unknown } | null = null;
+
+  const parseDownloadResponse = async (
+    res: Response,
+    attemptTag: string,
+    debugExtra?: Record<string, unknown>,
+  ): Promise<
+    | { ok: true; bytes: Uint8Array }
+    | { ok: false; failure: { ok: false; status: number; data: unknown; debug?: unknown }; signatureMismatch?: boolean }
+  > => {
+    const buf = await res.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+
+    if (res.ok && isPdfMagic(bytes)) {
+      return { ok: true, bytes };
+    }
+
+    if (res.ok && bytes.length > 4 && bytes[0] === 0x50 && bytes[1] === 0x4b) {
+      return {
+        ok: false,
+        failure: {
+          ok: false,
+          status: res.status,
+          data: {
+            msg: "响应为 ZIP（可能为多文件打包），请与爱签确认 downloadFileType=1 或解压策略",
+          },
+          debug: { attempt: attemptTag, url, ...(debugExtra ?? {}) },
+        },
+      };
+    }
+
+    const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+    let parsed: unknown = null;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = null;
+    }
+
+    if (parsed && typeof parsed === "object") {
+      const parsedRecord = parsed as Record<string, unknown>;
+      const asign = (parsedRecord.asign ?? parsedRecord) as Record<string, unknown>;
+      const asignCode = asign?.code;
+      const isAsignError = !isAsignBizSuccessResponse(asign);
+      if (res.ok && !isAsignError) {
+        const b64 = findLongBase64InObject(parsed);
+        if (b64) {
+          try {
+            const pdfBytes = base64ToBytes(b64);
+            if (isPdfMagic(pdfBytes)) {
+              return { ok: true, bytes: pdfBytes };
+            }
+            if (pdfBytes.length > 500) {
+              return { ok: true, bytes: pdfBytes };
+            }
+          } catch {
+            /* noop */
+          }
+        }
+        return {
+          ok: false,
+          failure: {
+            ok: false,
+            status: res.status,
+            data: parsed,
+            debug: {
+              attempt: attemptTag,
+              note: "业务成功但未解析到 PDF 字节或 base64",
+              ...(debugExtra ?? {}),
+            },
+          },
+        };
+      }
+
+      const isSignatureMismatch = asignCode === 100016 || asignCode === "100016";
+      return {
+        ok: false,
+        failure: {
+          ok: false,
+          status: res.status,
+          data: parsed,
+          debug: {
+            attempt: attemptTag,
+            asignCode,
+            asignMsg: asign?.msg,
+            ...(debugExtra ?? {}),
+          },
+        },
+        signatureMismatch: isSignatureMismatch,
+      };
+    }
+
+    return {
+      ok: false,
+      failure: {
+        ok: false,
+        status: res.status,
+        data: { msg: "非 PDF 且非 JSON", preview: text.slice(0, 400) },
+        debug: { attempt: attemptTag, url, ...(debugExtra ?? {}) },
+      },
+    };
+  };
+
+  for (const attempt of attemptsEffective) {
+    const effectiveBizJson = attempt.useOfficialBizJson ? bizDataJsonStrict : bizDataJson;
+
+    const tsMode = attempt.timestampMode ?? "static";
+    let ts = attempt.timestamp;
+    if (tsMode === "ms_plus_600") {
+      ts = String(Date.now() + 600 * 1000);
+    } else if (tsMode === "ms") {
+      ts = String(Date.now());
+    }
+
+    const built = await buildAsignHeaders(effectiveBizJson, appId, ts, {
+      signHash: attempt.signHash,
+      signPlaintextMode: attempt.signPlaintextMode,
+      signEncoding: attempt.signEncoding,
+      headerMode: attempt.headerMode,
+    });
+
+    const headers = built.headers;
+    const signStr = built.signStr;
+    const missingPrivateKey = built.missingPrivateKey;
+    const signHash = built.signHash;
+    const signPlaintextMode = built.signPlaintextMode;
+    const privateKeySource = built.privateKeySource;
+
+    const form = new FormData();
+    form.set("bizData", effectiveBizJson);
+    form.set("appId", appId);
+    form.set("timestamp", ts);
+
+    const controller = new AbortController();
+    const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
+
+    let res: Response | null = null;
+    try {
+      res = await fetch(url, { method: "POST", headers, body: form, signal: controller.signal });
+      const parsed = await parseDownloadResponse(res, attempt.tag, {
+        signStr,
+        missingPrivateKey,
+        privateKeySource,
+        signHash,
+        signPlaintextMode,
+        appId,
+        timestamp: ts,
+        useOfficialBizJson: Boolean(attempt.useOfficialBizJson),
+        bizData,
+      });
+      if (parsed.ok) {
+        return { ok: true, bytes: parsed.bytes };
+      }
+      lastFailure = parsed.failure;
+      if (parsed.signatureMismatch) {
+        continue;
+      }
+      break;
+    } catch (fetchErr) {
+      const errMsg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+      lastFailure = {
+        ok: false,
+        status: 0,
+        data: { msg: "ASIGN_DOWNLOAD_FETCH_ERROR", detail: errMsg },
+        debug: {
+          url,
+          attempt: attempt.tag,
+          signStr,
+          missingPrivateKey,
+          privateKeySource,
+          signHash,
+          signPlaintextMode,
+          appId,
+          timestamp: ts,
+          bizData,
+        },
+      };
+      break;
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
+  }
+
+  // fallback: 某些环境下 downloadContract 走“非 bizData”参数风格（文档仅列 contractNo/force/downloadFileType）
+  // 这里尝试 legacy 方案：raw 表单 / query 参数 + kv_sorted 签名。
+  const envPrivateKey = (Deno.env.get("ASIGN_PRIVATE_KEY") ?? "").trim();
+  const fallbackPrivateKey = (ASIGN_PRIVATE_KEY_FALLBACK || "").trim();
+  const privateKey = envPrivateKey || fallbackPrivateKey;
+  if (!privateKey) {
+    return lastFailure ?? { ok: false, status: 500, data: { msg: "missing private key" } };
+  }
+  const legacySignHash = getAsignSignHash();
+  const nowSec = String(Math.floor(Date.now() / 1000));
+  const legacyTsCandidates = [nowSec, String(Date.now() + 600 * 1000)];
+  const legacyHeaderModes: Array<"full" | "sign_only"> = ["full", "sign_only"];
+  const legacyReqModes: Array<"post_form" | "get_query"> = ["post_form", "get_query"];
+
+  for (const ts of legacyTsCandidates) {
+    const signParams: Record<string, unknown> = {
+      appId,
+      contractNo: String(args.contractNo).trim(),
+      force: args.force ?? 0,
+      downloadFileType: args.downloadFileType ?? 1,
+      timestamp: ts,
+    };
+    let sign = "";
+    let signStr = "";
+    try {
+      const out = await generateSignKvSorted(signParams, privateKey, legacySignHash);
+      sign = out.sign;
+      signStr = out.signStr;
+    } catch (e) {
+      return {
+        ok: false,
+        status: 500,
+        data: { msg: "legacy sign build failed", detail: e instanceof Error ? e.message : String(e) },
+      };
+    }
+
+    for (const headerMode of legacyHeaderModes) {
+      const headers: Record<string, string> = headerMode === "full"
+        ? { sign, appId, timestamp: ts }
+        : { sign };
+      for (const reqMode of legacyReqModes) {
+        const controller = new AbortController();
+        const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          let res: Response;
+          if (reqMode === "post_form") {
+            const form = new FormData();
+            form.set("contractNo", String(args.contractNo).trim());
+            form.set("force", String(args.force ?? 0));
+            form.set("downloadFileType", String(args.downloadFileType ?? 1));
+            form.set("appId", appId);
+            form.set("timestamp", ts);
+            res = await fetch(url, { method: "POST", headers, body: form, signal: controller.signal });
+          } else {
+            const qp = new URLSearchParams({
+              contractNo: String(args.contractNo).trim(),
+              force: String(args.force ?? 0),
+              downloadFileType: String(args.downloadFileType ?? 1),
+              appId,
+              timestamp: ts,
+            });
+            res = await fetch(`${url}?${qp.toString()}`, { method: "GET", headers, signal: controller.signal });
+          }
+
+          const parsed = await parseDownloadResponse(res, `legacy_${reqMode}_${headerMode}`, {
+            signStr,
+            signHash: legacySignHash,
+            timestamp: ts,
+          });
+          if (parsed.ok) {
+            return { ok: true, bytes: parsed.bytes };
+          }
+          lastFailure = parsed.failure;
+        } catch (e) {
+          lastFailure = {
+            ok: false,
+            status: 0,
+            data: { msg: "ASIGN_DOWNLOAD_LEGACY_FETCH_ERROR", detail: e instanceof Error ? e.message : String(e) },
+            debug: { timestamp: ts, headerMode, reqMode },
+          };
+        } finally {
+          clearTimeout(timeoutHandle);
+        }
+      }
+    }
+  }
+
+  return lastFailure ?? { ok: false, status: 500, data: { msg: "unknown download failure" } };
+}
