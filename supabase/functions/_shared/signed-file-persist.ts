@@ -151,6 +151,7 @@ export async function uploadPdfBytesAndAttachToSigningRecords(
       signed_file_url: publicUrl,
       uploaded_at: now,
       uploaded_by: opts.uploadedBy,
+      completed_at: now,
     })
     .in("id", recordIds);
 
@@ -159,17 +160,18 @@ export async function uploadPdfBytesAndAttachToSigningRecords(
   }
 
   for (const rid of recordIds) {
-    const { error: docErr } = await admin
+    const { error: docError } = await admin
       .from("signed_documents")
       .update({
         file_url: publicUrl,
         file_size: size,
         signed_at: now,
+        completed_at: now,
       })
       .eq("signing_record_id", rid);
 
-    if (docErr) {
-      console.warn(LOG, "更新 signed_documents 失败", rid, docErr.message);
+    if (docError) {
+      console.warn(LOG, "更新 signed_documents 失败", rid, docError.message);
     }
   }
 
@@ -214,6 +216,7 @@ export async function applyExternalSignedFileUrlToSigningRecords(
       signed_file_url: url,
       uploaded_at: now,
       uploaded_by: uploadedBy,
+      completed_at: now,
     })
     .in("id", recordIds);
 
@@ -222,16 +225,17 @@ export async function applyExternalSignedFileUrlToSigningRecords(
   }
 
   for (const rid of recordIds) {
-    const { error: docErr } = await admin
+    const { error: docError } = await admin
       .from("signed_documents")
       .update({
         file_url: url,
         signed_at: now,
+        completed_at: now,
       })
       .eq("signing_record_id", rid);
 
-    if (docErr) {
-      console.warn(LOG, "更新 signed_documents(URL) 失败", rid, docErr.message);
+    if (docError) {
+      console.warn(LOG, "更新 signed_documents(URL) 失败", rid, docError.message);
     }
   }
 

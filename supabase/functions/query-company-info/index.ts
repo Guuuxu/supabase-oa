@@ -1,4 +1,47 @@
+import md5 from 'https://esm.sh/md5@2.3.0';
 import { corsHeaders } from '../_shared/cors.ts';
+
+/** 企查查 Token：MD5(Key + Timespan + SecretKey)，32 位大写 */
+function buildQccToken(appKey: string, timespanSec: string, secretKey: string): string {
+  return md5(appKey + timespanSec + secretKey).toUpperCase();
+}
+
+/** 官方返回：顶层 Status（如 "200"）、Message、Result（企业照面字段） */
+function parseQccResultPayload(raw: unknown): Record<string, unknown> | null {
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    return raw as Record<string, unknown>;
+  }
+  if (typeof raw === 'string' && raw.trim()) {
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function qccRequestSucceeded(data: Record<string, unknown>): boolean {
+  const s = data.Status ?? data.status;
+  return s === '200' || s === 200;
+}
+
+function pickStr(obj: Record<string, unknown>, key: string): string {
+  const v = obj[key];
+  return typeof v === 'string' ? v : '';
+}
+
+function formatQccCapital(r: Record<string, unknown>): string {
+  const regist = pickStr(r, 'RegistCapi');
+  if (regist.trim()) return regist;
+  const cap = pickStr(r, 'RegisteredCapital');
+  const unit = pickStr(r, 'RegisteredCapitalUnit');
+  const ccy = pickStr(r, 'RegisteredCapitalCCY');
+  return [cap, unit, ccy].filter(Boolean).join('');
+}
 
 // 企业工商信息查询Edge Function
 Deno.serve(async (req) => {
@@ -22,32 +65,33 @@ Deno.serve(async (req) => {
       );
     }
 
-    // 获取API密钥
-    const apiKey = Deno.env.get('INTEGRATIONS_API_KEY');
-    if (!apiKey) {
-      console.error('INTEGRATIONS_API_KEY未配置');
+    const qccKey = (Deno.env.get('QICHACHA_KEY') ?? '').trim();
+    const qccSecret = (Deno.env.get('QICHACHA_SECRET_KEY') ?? '').trim();
+    if (!qccKey || !qccSecret) {
+      console.error('QICHACHA_KEY 或 QICHACHA_SECRET_KEY 未配置');
       return new Response(
         JSON.stringify({ error: '系统配置错误，请联系管理员' }),
-        { 
-          status: 500, 
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+        {
+          status: 500,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         }
       );
     }
 
-    // 调用企业工商信息查询API
-    const apiUrl = `https://app-9yg25rlq3p4x-api-e94GZ5j0Kxja-gateway.appmiaoda.com/business4/get?keyword=${encodeURIComponent(keyword)}`;
-    
+    const timespan = String(Math.floor(Date.now() / 1000));
+    const token = buildQccToken(qccKey, timespan, qccSecret);
+    const apiUrl =
+      `https://api.qichacha.com/ECIV4/GetBasicDetailsByName?key=${encodeURIComponent(qccKey)}&keyword=${encodeURIComponent(keyword)}`;
+
     console.log('查询企业工商信息 - 关键字:', keyword);
-    console.log('API URL:', apiUrl);
-    console.log('API Key存在:', !!apiKey);
-    
+
     const response = await fetch(apiUrl, {
       method: 'GET',
       headers: {
-        'X-Gateway-Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json;charset=UTF-8'
-      }
+        Token: token,
+        Timespan: timespan,
+        'Content-Type': 'application/json;charset=UTF-8',
+      },
     });
 
     console.log('API响应状态:', response.status);
@@ -73,41 +117,42 @@ Deno.serve(async (req) => {
       );
     }
 
-    const data = await response.json();
+    const data = (await response.json()) as Record<string, unknown>;
     console.log('API返回数据:', JSON.stringify(data).substring(0, 500));
 
-    // 检查API返回结果 - 更宽松的判断
-    if (!data.success) {
-      console.error('API返回失败:', data);
+    if (!qccRequestSucceeded(data)) {
+      const msg =
+        pickStr(data, 'Message') ||
+        pickStr(data, 'message') ||
+        pickStr(data, 'msg') ||
+        '查询失败，请检查公司名称是否正确';
+      console.error('qcc-query 企查查业务失败:', data.Status, msg);
       return new Response(
-        JSON.stringify({ 
-          error: data.msg || '查询失败，请检查公司名称是否正确',
-          details: '建议使用公司全称进行查询'
+        JSON.stringify({
+          error: msg,
+          details: '建议使用公司全称进行查询',
         }),
-        { 
-          status: 404, 
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+        {
+          status: 404,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         }
       );
     }
 
-    // 检查是否有数据返回
-    if (!data.data || !data.data.data || !data.data.data.base) {
-      console.error('API返回数据结构异常:', JSON.stringify(data));
+    const base = parseQccResultPayload(data.Result);
+    if (!base || !pickStr(base, 'Name')) {
+      console.error('qcc-query Result 无有效企业数据:', JSON.stringify(data).substring(0, 800));
       return new Response(
-        JSON.stringify({ 
+        JSON.stringify({
           error: '未找到该企业的工商信息',
-          suggestion: '请确认公司名称是否完整正确，建议使用营业执照上的完整名称'
+          suggestion: '请确认公司名称是否完整正确，建议使用营业执照上的完整名称',
         }),
-        { 
-          status: 404, 
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+        {
+          status: 404,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         }
       );
     }
-
-    // 提取企业基本信息
-    const base = data.data.data.base;
     
     // 智能提取所在地域（从地址中提取城市）
     const extractRegion = (address: string): string => {
@@ -177,19 +222,21 @@ Deno.serve(async (req) => {
       return '其他';
     };
     
+    const orgNo = pickStr(base, 'OrgNo');
+    const regNo = pickStr(base, 'No');
     const result = {
-      companyName: base.companyName || '',
-      creditNo: base.creditNo || '',
-      legalPerson: base.legalPerson || '',
-      companyAddress: base.companyAddress || '',
-      region: extractRegion(base.companyAddress || ''),
-      industry: extractIndustry(base.companyType || '', base.businessScope || ''),
-      companyCode: base.companyCode || '',
-      establishDate: base.establishDate || '',
-      companyStatus: base.companyStatus || '',
-      capital: base.capital || '',
-      companyType: base.companyType || '',
-      businessScope: base.businessScope || ''
+      companyName: pickStr(base, 'Name'),
+      creditNo: pickStr(base, 'CreditCode'),
+      legalPerson: pickStr(base, 'OperName'),
+      companyAddress: pickStr(base, 'Address'),
+      region: extractRegion(pickStr(base, 'Address')),
+      industry: extractIndustry(pickStr(base, 'EconKind'), pickStr(base, 'Scope')),
+      companyCode: orgNo || regNo,
+      establishDate: pickStr(base, 'StartDate'),
+      companyStatus: pickStr(base, 'Status'),
+      capital: formatQccCapital(base),
+      companyType: pickStr(base, 'EconKind'),
+      businessScope: pickStr(base, 'Scope'),
     };
 
     console.log('查询成功:', result.companyName);
@@ -204,10 +251,11 @@ Deno.serve(async (req) => {
 
   } catch (error) {
     console.error('查询企业工商信息失败:', error);
+    const message = error instanceof Error ? error.message : String(error);
     return new Response(
-      JSON.stringify({ 
+      JSON.stringify({
         error: '查询失败，请稍后重试',
-        details: error.message 
+        details: message,
       }),
       { 
         status: 500, 

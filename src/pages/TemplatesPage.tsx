@@ -46,11 +46,18 @@ import {
 import { Checkbox } from '@/components/ui/checkbox';
 import { Badge } from '@/components/ui/badge';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { getDocumentTemplates, getCompanies, createDocumentTemplate, updateDocumentTemplate, deleteDocumentTemplate } from '@/db/api';
+import {
+  getDocumentTemplates,
+  getCompanies,
+  createDocumentTemplate,
+  updateDocumentTemplate,
+  deleteDocumentTemplate,
+  syncAsignTemplatesToDocumentTemplates,
+} from '@/db/api';
 import { DOCUMENT_CATEGORY_LABELS, DOCUMENT_CATEGORY_LABELS_WITH_UNIVERSAL, DOCUMENT_TEMPLATE_NAMES, DocumentCategoryWithUniversal } from '@/types/types';
 import type { DocumentTemplate, Company, DocumentCategory } from '@/types/types';
 import { toast } from 'sonner';
-import { Plus, Pencil, Trash2, Search, Check, ChevronsUpDown, X } from 'lucide-react';
+import { Plus, Pencil, Trash2, Search, Check, ChevronsUpDown, X, CloudDownload } from 'lucide-react';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useAuth } from '@/contexts/AuthContext';
 import { cn } from '@/lib/utils';
@@ -76,6 +83,18 @@ export default function TemplatesPage() {
     content: '',
     requires_company_signature: false,
     is_universal: false
+  });
+  const [syncDialogOpen, setSyncDialogOpen] = useState(false);
+  const [syncCompanyPopoverOpen, setSyncCompanyPopoverOpen] = useState(false);
+  const [syncingAsign, setSyncingAsign] = useState(false);
+  const [syncForm, setSyncForm] = useState({
+    as_universal: false,
+    company_id: '' as string,
+    category: 'employment' as DocumentCategory,
+    /** 与爱签请求示例 templateIdent 一致，留空则拉全量 */
+    template_ident: '',
+    /** 请求 Edge 返回 diagnostic，并在控制台打印 */
+    debug: false,
   });
 
   useEffect(() => {
@@ -289,6 +308,69 @@ export default function TemplatesPage() {
     return companies.find(c => c.id === selectedCompanyId)?.name;
   };
 
+  const openSyncAsignDialog = () => {
+    const defaultCo = isSuperAdmin(profile)
+      ? (selectedCompanyId || '')
+      : String(profile?.company_id || selectedCompanyId || '');
+    setSyncForm({
+      as_universal: false,
+      company_id: defaultCo,
+      category: 'employment',
+      template_ident: '',
+      debug: false,
+    });
+    setSyncDialogOpen(true);
+  };
+
+  const handleSyncAsignSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (syncForm.as_universal) {
+      if (!isSuperAdmin(profile)) {
+        toast.error('仅超级管理员可将爱签模板同步为通用模板');
+        return;
+      }
+    } else if (!syncForm.company_id) {
+      toast.error('请选择同步到哪个公司');
+      return;
+    }
+
+    setSyncingAsign(true);
+    try {
+      const result = await syncAsignTemplatesToDocumentTemplates({
+        company_id: syncForm.as_universal ? null : syncForm.company_id,
+        category: syncForm.category,
+        template_ident: syncForm.template_ident.trim() || undefined,
+        debug: syncForm.debug,
+      });
+      if (!result.ok) {
+        toast.error(result.error);
+        return;
+      }
+      if (result.diagnostic) {
+        console.log('[ASIGN_TPL_SYNC] diagnostic', result.diagnostic);
+      }
+      const extra =
+        result.errors.length > 0
+          ? `；部分行失败 ${result.errors.length} 条（见控制台）`
+          : '';
+      console.log('[ASIGN_TPL_SYNC] 明细', result.errors);
+      const zeroTouched = result.inserted === 0 && result.updated === 0 && result.skipped === 0;
+      if (zeroTouched) {
+        toast.warning(
+          '爱签返回了成功，但未解析到任何模板行（新增/更新/跳过均为 0）。请确认开放平台里已有模板；可在同步弹窗勾选「调试诊断」后重试，并在控制台查看 [ASIGN_TPL_SYNC] diagnostic。',
+        );
+      } else {
+        toast.success(
+          `同步完成：新增 ${result.inserted}，更新 ${result.updated}，跳过无编号 ${result.skipped}${extra}`,
+        );
+      }
+      setSyncDialogOpen(false);
+      await loadData();
+    } finally {
+      setSyncingAsign(false);
+    }
+  };
+
   return (
     <MainLayout>
       <div className="space-y-6">
@@ -297,7 +379,12 @@ export default function TemplatesPage() {
             <h1 className="text-3xl font-bold">文书模板管理</h1>
             <p className="text-muted-foreground mt-2">管理各类人力资源文书模板</p>
           </div>
-          <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button type="button" variant="secondary" onClick={openSyncAsignDialog}>
+              <CloudDownload className="mr-2 h-4 w-4" />
+              从爱签同步模板
+            </Button>
+            <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
             <DialogTrigger asChild>
               <Button onClick={() => handleOpenDialog()}>
                 <Plus className="mr-2 h-4 w-4" />
@@ -466,7 +553,139 @@ export default function TemplatesPage() {
               </form>
             </DialogContent>
           </Dialog>
+          </div>
         </div>
+
+        <Dialog open={syncDialogOpen} onOpenChange={setSyncDialogOpen}>
+          <DialogContent className="max-w-lg">
+            <form onSubmit={handleSyncAsignSubmit}>
+              <DialogHeader>
+                <DialogTitle>从爱签同步模板</DialogTitle>
+                <DialogDescription>
+                  请求体与官方示例一致：page、rows；可选 templateIdent 指定单个模板编号。需已配置与爱签 createContract 相同的环境变量（ASIGN_APP_ID、私钥、网关等）。
+                </DialogDescription>
+              </DialogHeader>
+              <div className="space-y-4 py-4">
+                <div className="space-y-2">
+                  <Label htmlFor="sync_template_ident">模板编号（可选）</Label>
+                  <Input
+                    id="sync_template_ident"
+                    placeholder="留空同步全部；填写则传 templateIdent，如 TN…"
+                    value={syncForm.template_ident}
+                    onChange={(e) => setSyncForm({ ...syncForm, template_ident: e.target.value })}
+                  />
+                </div>
+                {isSuperAdmin(profile) ? (
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="sync_as_universal"
+                      checked={syncForm.as_universal}
+                      onCheckedChange={(checked) =>
+                        setSyncForm({
+                          ...syncForm,
+                          as_universal: checked as boolean,
+                          company_id: checked ? '' : syncForm.company_id,
+                        })
+                      }
+                    />
+                    <Label htmlFor="sync_as_universal" className="text-sm font-normal cursor-pointer">
+                      同步为通用模板（全公司可用）
+                    </Label>
+                  </div>
+                ) : null}
+                {!syncForm.as_universal ? (
+                  <div className="space-y-2">
+                    <Label>同步到所属公司 *</Label>
+                    <Popover open={syncCompanyPopoverOpen} onOpenChange={setSyncCompanyPopoverOpen}>
+                      <PopoverTrigger asChild>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          role="combobox"
+                          className="w-full justify-between"
+                          disabled={!isSuperAdmin(profile) && Boolean(profile?.company_id)}
+                        >
+                          {syncForm.company_id
+                            ? companies.find((c) => c.id === syncForm.company_id)?.name
+                            : '选择公司'}
+                          <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                        </Button>
+                      </PopoverTrigger>
+                      <PopoverContent className="w-[400px] p-0">
+                        <Command>
+                          <CommandInput placeholder="搜索公司名称..." />
+                          <CommandList>
+                            <CommandEmpty>未找到匹配的公司</CommandEmpty>
+                            <CommandGroup>
+                              {companies.map((company) => (
+                                <CommandItem
+                                  key={company.id}
+                                  value={company.name}
+                                  onSelect={() => {
+                                    setSyncForm({ ...syncForm, company_id: company.id });
+                                    setSyncCompanyPopoverOpen(false);
+                                  }}
+                                >
+                                  <Check
+                                    className={cn(
+                                      'mr-2 h-4 w-4',
+                                      syncForm.company_id === company.id ? 'opacity-100' : 'opacity-0',
+                                    )}
+                                  />
+                                  {company.name}
+                                </CommandItem>
+                              ))}
+                            </CommandGroup>
+                          </CommandList>
+                        </Command>
+                      </PopoverContent>
+                    </Popover>
+                  </div>
+                ) : null}
+                <div className="flex items-center space-x-2">
+                  <Checkbox
+                    id="sync_asign_debug"
+                    checked={syncForm.debug}
+                    onCheckedChange={(checked) =>
+                      setSyncForm({ ...syncForm, debug: checked as boolean })
+                    }
+                  />
+                  <Label htmlFor="sync_asign_debug" className="text-sm font-normal cursor-pointer">
+                    调试诊断（响应里带解析线索，控制台搜 ASIGN_TPL_SYNC）
+                  </Label>
+                </div>
+                <div className="space-y-2">
+                  <Label>写入文书分类</Label>
+                  <Select
+                    value={syncForm.category}
+                    onValueChange={(value) =>
+                      setSyncForm({ ...syncForm, category: value as DocumentCategory })
+                    }
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {Object.entries(DOCUMENT_CATEGORY_LABELS).map(([key, label]) => (
+                        <SelectItem key={key} value={key}>
+                          {label as string}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+              <DialogFooter>
+                <Button type="button" variant="outline" onClick={() => setSyncDialogOpen(false)}>
+                  取消
+                </Button>
+                <Button type="submit" disabled={syncingAsign}>
+                  {syncingAsign ? '同步中…' : '开始同步'}
+                </Button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
 
         {/* 公司筛选器 */}
         <div className="flex items-center gap-4">
@@ -582,7 +801,19 @@ export default function TemplatesPage() {
                       <TableBody>
                         {getTemplatesByCategory(category as DocumentCategory).map((template) => (
                           <TableRow key={template.id}>
-                            <TableCell className="font-medium">{template.name}</TableCell>
+                            <TableCell className="font-medium">
+                              <div className="flex flex-col gap-1">
+                                <span>{template.name}</span>
+                                {template.asign_template_ident ? (
+                                  <Badge variant="outline" className="w-fit text-xs font-normal">
+                                    爱签 · {template.asign_template_ident}
+                                    {template.asign_template_type != null
+                                      ? `（类型 ${template.asign_template_type}）`
+                                      : ''}
+                                  </Badge>
+                                ) : null}
+                              </div>
+                            </TableCell>
                             <TableCell>
                               {template.company_id ? (
                                 template.company?.name || '-'

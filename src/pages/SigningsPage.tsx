@@ -2508,7 +2508,7 @@ export default function SigningsPage() {
    * noticeMobile：须传员工手机号，用于接收签署链接短信（与文档一致，非意愿验证码）；电子签仅包含有手机号的员工。
    * signType：3 感知签（非静默）；isNotice：1 发短信签署链接。
    * validateType：个人手写+短信常用 7；6=逐字手写识别+短信（prev/test 常未开通会报「参数异常」）。可用 .env 的 VITE_ASIGN_VALIDATE_TYPE_INDIVIDUAL 覆盖。企业勿用 6/7，常用 16（或 VITE_ASIGN_VALIDATE_TYPE_ENTERPRISE）。
-   * signStrategyList：坐标签章 locationMode=2 须用 signPage、signX、signY；attachNo 与 create 返回 contractFiles 序号一致。
+   * signStrategyList：坐标签章 locationMode=2 须用 signPage、signX、signY；模板坐标 locationMode=4 须用 signKey（与模板内签署位关键字一致）；attachNo 与 create 返回 contractFiles 序号一致。
    */
   const buildAsignAddSignerItemsForEmployees = (
     employeeRows: EmployeeFormData[],
@@ -2535,29 +2535,22 @@ export default function SigningsPage() {
       1,
     );
 
-    /** 甲方：坐标签章 */
+    /** 甲方：模板坐标 locationMode=4，signKey 须与爱签模板中甲方签署位关键字一致 */
     const strategyPartyA: AsignSignStrategyItem[] = [
       {
         attachNo,
-        locationMode: 2,
-        /** 策略内 signType：1 签章（坐标签章常见要求，Edge 也会补，此处显式传入减少环境差异） */
+        locationMode: 4,
         signType: 1,
-        signPage: 1,
-        signX: 0.17,
-        signY: 0.16,
-        canDrag: 1
+        signKey: '甲方',
       },
     ];
-    /** 乙方（员工）：坐标签章；mode=2 勿传 signKey（仅关键字/模板坐标需要） */
+    /** 乙方（员工/个人）：模板坐标 locationMode=4，signKey 须与模板中乙方签署位关键字一致 */
     const strategyPartyB: AsignSignStrategyItem[] = [
       {
         attachNo,
-        locationMode: 2,
+        locationMode: 4,
         signType: 1,
-        signPage: 1,
-        signX: 0.70,
-        signY: 0.17,
-        canDrag:1 
+        signKey: '乙方',
       },
     ];
 
@@ -3027,7 +3020,8 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
     const updates: any = { status };
     
     if (status === 'employee_signed') {
-      updates.employee_signed_at = new Date().toISOString();
+      const now = new Date().toISOString();
+      updates.employee_signed_at = now;
 
       // 如果当前签署记录选用的模板满足 requires_company_signature=true，
       // 则“不需要公司签署”（requires_company_signature=false），员工签署后直接置为 completed。
@@ -3037,11 +3031,14 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
         const requiresCompanySignature = selectedTemplates.some(t => t.requires_company_signature);
         if (!requiresCompanySignature) {
           updates.status = 'completed';
+          updates.completed_at = now;
         }
       }
     } else if (status === 'company_signed' || status === 'completed') {
-      updates.company_signed_at = new Date().toISOString();
+      const now = new Date().toISOString();
+      updates.company_signed_at = now;
       updates.status = 'completed';
+      updates.completed_at = now;
     }
 
     const success = await updateSigningRecord(id, updates);

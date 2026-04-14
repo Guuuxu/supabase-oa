@@ -22,7 +22,8 @@ import type {
   SalarySignatureType,
   SalarySignatureStatus,
   AttendanceSignature,
-  AttendanceSignatureStatus
+  AttendanceSignatureStatus,
+  DocumentCategory,
 } from '@/types/types';
 
 // 重新导出类型供其他模块使用
@@ -1008,6 +1009,68 @@ export async function deleteDocumentTemplate(id: string): Promise<boolean> {
   return true;
 }
 
+export type SyncAsignTemplatesResult =
+  | {
+      ok: true;
+      inserted: number;
+      updated: number;
+      skipped: number;
+      errors: string[];
+      has_more_errors?: boolean;
+      /** 服务端在 0 条或 debug 时返回，便于核对爱签实际 JSON 结构 */
+      diagnostic?: Record<string, unknown>;
+    }
+  | { ok: false; error: string; detail?: unknown };
+
+/** Edge sync-asign-templates：拉取爱签 template/list 并写入 document_templates */
+export async function syncAsignTemplatesToDocumentTemplates(params: {
+  company_id: string | null;
+  category?: DocumentCategory;
+  rows_per_page?: number;
+  max_pages?: number;
+  /** 爱签 bizData.templateIdent，只同步指定模板编号 */
+  template_ident?: string;
+  /** 为 true 时响应中始终带 diagnostic */
+  debug?: boolean;
+}): Promise<SyncAsignTemplatesResult> {
+  const { data, error } = await supabase.functions.invoke('sync-asign-templates', {
+    body: {
+      company_id: params.company_id,
+      category: params.category,
+      rows_per_page: params.rows_per_page,
+      max_pages: params.max_pages,
+      template_ident: params.template_ident?.trim() || undefined,
+      debug: params.debug === true,
+    },
+  });
+
+  if (error) {
+    console.error('[ASIGN_TPL_SYNC] invoke 失败:', error.message);
+    return { ok: false, error: error.message };
+  }
+
+  const payload = data as Record<string, unknown> | null;
+  if (!payload || payload.ok !== true) {
+    const errMsg =
+      payload && typeof payload.error === 'string' ? payload.error : '爱签模板同步失败';
+    return { ok: false, error: errMsg, detail: payload };
+  }
+
+  const diag = payload.diagnostic;
+  return {
+    ok: true,
+    inserted: Number(payload.inserted) || 0,
+    updated: Number(payload.updated) || 0,
+    skipped: Number(payload.skipped) || 0,
+    errors: Array.isArray(payload.errors) ? (payload.errors as string[]) : [],
+    has_more_errors: Boolean(payload.has_more_errors),
+    diagnostic:
+      diag && typeof diag === 'object' && !Array.isArray(diag)
+        ? (diag as Record<string, unknown>)
+        : undefined,
+  };
+}
+
 // ==================== Signing Records ====================
 export async function getSigningRecords(filters?: {
   companyId?: string;
@@ -1083,7 +1146,8 @@ export async function createSigningRecord(record: Omit<SigningRecord, 'id' | 'cr
           template_name: template.name,
           file_url: null, // 初始状态没有文件
           file_size: null,
-          signed_at: null // 初始状态未签署
+          signed_at: null, // 初始状态未签署
+          completed_at: null // 初始状态未完成
         }));
 
         const { error: docsError } = await supabase
@@ -1103,6 +1167,11 @@ export async function createSigningRecord(record: Omit<SigningRecord, 'id' | 'cr
 }
 
 export async function updateSigningRecord(id: string, updates: Partial<SigningRecord>): Promise<boolean> {
+  // 如果状态更新为已完成且没有提供完成时间，则自动填充
+  if (updates.status === 'completed' && !updates.completed_at) {
+    updates.completed_at = new Date().toISOString();
+  }
+
   const { error } = await supabase
     .from('signing_records')
     .update(updates)
@@ -1112,6 +1181,20 @@ export async function updateSigningRecord(id: string, updates: Partial<SigningRe
     console.error('更新签署记录失败:', error);
     return false;
   }
+
+  // 如果状态更新为已完成，同步更新 signed_documents 的 completed_at
+  if (updates.status === 'completed') {
+    const completedAt = updates.completed_at;
+    const { error: docError } = await supabase
+      .from('signed_documents')
+      .update({ completed_at: completedAt })
+      .eq('signing_record_id', id);
+
+    if (docError) {
+      console.error('同步更新 signed_documents.completed_at 失败:', docError);
+    }
+  }
+
   return true;
 }
 
@@ -1251,6 +1334,7 @@ export async function updateSigningRecordFile(
       signed_file_url: normalizedUrl,
       uploaded_at: now,
       uploaded_by: uploadedBy,
+      completed_at: now,
     })
     .eq('id', id);
 
@@ -1262,6 +1346,7 @@ export async function updateSigningRecordFile(
   const docPatch: Record<string, unknown> = {
     file_url: normalizedUrl,
     signed_at: now,
+    completed_at: now,
   };
   if (fileSize != null && Number.isFinite(fileSize)) {
     docPatch.file_size = Math.round(fileSize);

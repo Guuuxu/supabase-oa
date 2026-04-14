@@ -732,6 +732,7 @@ export default function SigningDataPage() {
                           <TableHead>文书名称</TableHead>
                           <TableHead>文件大小</TableHead>
                           <TableHead>签署时间</TableHead>
+                          <TableHead>完成时间</TableHead>
                           <TableHead>状态</TableHead>
                           <TableHead className="text-right">操作</TableHead>
                         </TableRow>
@@ -748,6 +749,11 @@ export default function SigningDataPage() {
                             <TableCell>
                               {doc.signed_at 
                                 ? new Date(doc.signed_at).toLocaleString('zh-CN') 
+                                : '-'}
+                            </TableCell>
+                            <TableCell>
+                              {doc.completed_at 
+                                ? new Date(doc.completed_at).toLocaleString('zh-CN') 
                                 : '-'}
                             </TableCell>
                             <TableCell>

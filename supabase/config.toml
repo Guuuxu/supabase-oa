@@ -419,6 +419,13 @@ verify_jwt = true
 import_map = "./functions/download-asign-contract/deno.json"
 entrypoint = "./functions/download-asign-contract/index.ts"
 
+# 爱签：template/list 同步到 document_templates（需登录 + 模板创建权限）
+[functions.sync-asign-templates]
+enabled = true
+verify_jwt = true
+import_map = "./functions/sync-asign-templates/deno.json"
+entrypoint = "./functions/sync-asign-templates/index.ts"
+
 # 管理员创建用户（service_role + auth.admin.createUser，避免前端 signUp 抢占会话）
 [functions.admin-create-user]
 enabled = true

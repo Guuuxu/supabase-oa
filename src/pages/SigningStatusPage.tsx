@@ -354,7 +354,7 @@ export default function SigningStatusPage() {
                           <TableHead>年月</TableHead>
                           <TableHead>状态</TableHead>
                           <TableHead>发送时间</TableHead>
-                          <TableHead>签署时间</TableHead>
+                          <TableHead>完成时间</TableHead>
                           <TableHead className="text-right">操作</TableHead>
                         </TableRow>
                       </TableHeader>
@@ -395,7 +395,7 @@ export default function SigningStatusPage() {
                               {record.created_at ? new Date(record.created_at).toLocaleString('zh-CN') : '-'}
                             </TableCell>
                             <TableCell className="whitespace-nowrap">
-                              {record.employee_signed_at ? new Date(record.employee_signed_at).toLocaleString('zh-CN') : '-'}
+                              {record.completed_at ? new Date(record.completed_at).toLocaleString('zh-CN') : record.employee_signed_at ? new Date(record.employee_signed_at).toLocaleString('zh-CN') : '-'}
                             </TableCell>
                             <TableCell className="text-right">
                               <div className="flex justify-end gap-2">
@@ -489,7 +489,7 @@ export default function SigningStatusPage() {
                           <TableHead>年月</TableHead>
                           <TableHead>状态</TableHead>
                           <TableHead>发送时间</TableHead>
-                          <TableHead>签署时间</TableHead>
+                          <TableHead>完成时间</TableHead>
                           <TableHead className="text-right">操作</TableHead>
                         </TableRow>
                       </TableHeader>
@@ -530,7 +530,7 @@ export default function SigningStatusPage() {
                               {record.created_at ? new Date(record.created_at).toLocaleString('zh-CN') : '-'}
                             </TableCell>
                             <TableCell className="whitespace-nowrap">
-                              {record.employee_signed_at ? new Date(record.employee_signed_at).toLocaleString('zh-CN') : '-'}
+                              {record.completed_at ? new Date(record.completed_at).toLocaleString('zh-CN') : record.employee_signed_at ? new Date(record.employee_signed_at).toLocaleString('zh-CN') : '-'}
                             </TableCell>
                             <TableCell className="text-right">
                               <div className="flex justify-end gap-2">

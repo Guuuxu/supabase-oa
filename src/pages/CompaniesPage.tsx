@@ -243,9 +243,9 @@ export default function CompaniesPage() {
     try {
       const { supabase } = await import('@/db/supabase');
       
-      // 构建完整的URL，使用GET方法传递查询参数
-      const response = await supabase.functions.invoke(`query-company-info?keyword=${encodeURIComponent(formData.name)}`, {
-        method: 'GET'
+      const fnQuery = new URLSearchParams({ keyword: formData.name.trim() });
+      const response = await supabase.functions.invoke(`query-company-info?${fnQuery.toString()}`, {
+        method: 'GET',
       });
 
       if (response.error) {

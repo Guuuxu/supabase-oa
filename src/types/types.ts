@@ -94,7 +94,7 @@ export interface Employee {
 
 export interface DocumentTemplate {
   id: string;
-  company_id: string;
+  company_id: string | null;
   name: string;
   category: DocumentCategory;
   content?: string;
@@ -103,6 +103,10 @@ export interface DocumentTemplate {
   created_at: string;
   updated_at: string;
   company?: Company;
+  /** 爱签开放平台模板编号（template/list） */
+  asign_template_ident?: string | null;
+  /** 爱签模板类型：1 word 2 pdf 3 html */
+  asign_template_type?: number | null;
 }
 
 export interface SigningRecord {
@@ -142,6 +146,7 @@ export interface SigningRecord {
     contact_phone?: string;
     legal_representative?: string;
   };
+  completed_at?: string;
   created_at: string;
   updated_at: string;
   company?: Company;
@@ -157,6 +162,7 @@ export interface SignedDocument {
   file_url?: string;
   file_size?: number;
   signed_at?: string;
+  completed_at?: string;
   created_at: string;
   updated_at: string;
 }
