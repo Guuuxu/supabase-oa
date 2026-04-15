@@ -1071,6 +1071,79 @@ export async function syncAsignTemplatesToDocumentTemplates(params: {
   };
 }
 
+export type OpenAsignTemplateResult =
+  | { ok: true; open_url?: string; data?: unknown }
+  | { ok: false; error: string; detail?: unknown; debug?: unknown };
+
+/** Edge open-asign-template：调用爱签 template/open，返回在线制作链接 */
+export async function openAsignTemplateDesigner(params?: {
+  template_ident?: string;
+  redirect_url?: string;
+  notify_url?: string;
+  hidden_basic?: 0 | 1;
+}): Promise<OpenAsignTemplateResult> {
+  const { data, error } = await supabase.functions.invoke('open-asign-template', {
+    body: {
+      template_ident: params?.template_ident?.trim() || undefined,
+      redirect_url: params?.redirect_url?.trim() || undefined,
+      notify_url: params?.notify_url?.trim() || undefined,
+      hidden_basic: params?.hidden_basic,
+    },
+  });
+
+  if (error) {
+    return { ok: false, error: error.message };
+  }
+  const payload = data as Record<string, unknown> | null;
+  if (!payload || payload.ok !== true) {
+    const errMsg = payload && typeof payload.error === 'string' ? payload.error : '打开爱签模板页面失败';
+    return {
+      ok: false,
+      error: errMsg,
+      detail: payload?.detail,
+      debug: payload?.debug,
+    };
+  }
+  const openUrl = typeof payload.open_url === 'string' ? payload.open_url : undefined;
+  return { ok: true, open_url: openUrl, data: payload.data };
+}
+
+export type GetAsignTemplateDataResult =
+  | { ok: true; data: unknown; template_ident: string }
+  | { ok: false; error: string; detail?: unknown; debug?: unknown };
+
+/** Edge get-asign-template-data：爱签 template/getTemplateData，用于配置前查看控件 key */
+export async function getAsignTemplateData(params: {
+  template_ident: string;
+}): Promise<GetAsignTemplateDataResult> {
+  const template_ident = (params.template_ident ?? '').trim();
+  if (!template_ident) {
+    return { ok: false, error: '缺少爱签模板编号' };
+  }
+  const { data, error } = await supabase.functions.invoke('get-asign-template-data', {
+    body: { template_ident },
+  });
+  if (error) {
+    return { ok: false, error: error.message };
+  }
+  const payload = data as Record<string, unknown> | null;
+  if (!payload || payload.ok !== true) {
+    const errMsg =
+      payload && typeof payload.error === 'string' ? payload.error : '获取爱签模板控件信息失败';
+    return {
+      ok: false,
+      error: errMsg,
+      detail: payload?.detail,
+      debug: payload?.debug,
+    };
+  }
+  return {
+    ok: true,
+    data: payload.data,
+    template_ident: typeof payload.template_ident === 'string' ? payload.template_ident : template_ident,
+  };
+}
+
 // ==================== Signing Records ====================
 export async function getSigningRecords(filters?: {
   companyId?: string;

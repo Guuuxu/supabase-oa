@@ -77,6 +77,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import { cn } from '@/lib/utils';
 import { supabase } from '@/db/supabase';
 import { htmlStringToPdfBlob } from '@/utils/htmlToPdf';
+import { buildAsignFillDataForContract } from '@/utils/asignFillData';
 
 export default function SigningsPage() {
   const { profile } = useAuth();
@@ -1633,7 +1634,7 @@ export default function SigningsPage() {
   </div>
 </body>
 </html>`,
-      '承诺书': `<!DOCTYPE html>
+      '员工承诺书': `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
@@ -2545,13 +2546,45 @@ export default function SigningsPage() {
       },
     ];
     /** 乙方（员工/个人）：模板坐标 locationMode=4，signKey 须与模板中乙方签署位关键字一致 */
+    /**
+     * 爱签 addSigner 会校验 signKey 必须在模板中存在；多传不存在的 key 会报 100617。
+     * 默认只传「当前日期」；若某模板日期位 key 不同，在 .env 设置 VITE_ASIGN_DATE_SIGN_KEYS=签署日期,签约日期（逗号分隔）。
+     * 若模板还有其它个人侧签署位，用 VITE_ASIGN_PARTY_B_EXTRA_SIGN_KEYS（逗号分隔，且模板须真实存在）。
+     */
+    const dateSignKeysFromEnv = (import.meta.env.VITE_ASIGN_DATE_SIGN_KEYS ?? '当前日期')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const dateSignKeysBase = dateSignKeysFromEnv.length > 0 ? dateSignKeysFromEnv : ['当前日期'];
+    const dateSignKeys = Array.from(new Set(dateSignKeysBase));
+    /**
+     * 个人侧「除签名、日期外」的额外签署位（如模板里单独放了手写抄录区），须与模板 signKey 完全一致。
+     * 默认不传；需要时在 .env 设置 VITE_ASIGN_PARTY_B_EXTRA_SIGN_KEYS=乙方,身份证号（逗号分隔）。
+     */
+    const extraPartyBSignKeysRaw = (import.meta.env.VITE_ASIGN_PARTY_B_EXTRA_SIGN_KEYS ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const extraPartyBSignKeys = Array.from(new Set(extraPartyBSignKeysRaw));
     const strategyPartyB: AsignSignStrategyItem[] = [
       {
         attachNo,
         locationMode: 4,
         signType: 1,
-        signKey: '乙方',
+        signKey: '个人',
       },
+      ...dateSignKeys.map((key) => ({
+        attachNo,
+        locationMode: 4 as const,
+        signType: 2 as const,
+        signKey: key,
+      })),
+      ...extraPartyBSignKeys.map((key) => ({
+        attachNo,
+        locationMode: 4 as const,
+        signType: 1 as const,
+        signKey: key,
+      })),
     ];
 
     const employeeItems: AsignAddSignerItem[] = [];
@@ -2712,19 +2745,28 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
       creditCode?: string;
     }>;
   }) => {
-    if (!previewFileUrl) {
-      throw new Error('缺少预览文件，无法发起签署');
+    const selectedForAsign = templates.filter((t) => formData.template_ids.includes(t.id));
+    const hasAsignIdent = (t: DocumentTemplate) => Boolean((t.asign_template_ident || '').trim());
+    const allAsignTemplateMode =
+      selectedForAsign.length > 0 && selectedForAsign.every(hasAsignIdent);
+    const someAsignNotAll =
+      selectedForAsign.some(hasAsignIdent) && !allAsignTemplateMode;
+
+    if (someAsignNotAll) {
+      throw new Error(
+        '所选文书不能混用「爱签模板」（已填模板编号）与普通文书，请只选一类后再发起。',
+      );
     }
-    const htmlText = await getHtmlForSigningPdf();
-    toast.info('正在生成签署文件，请稍候…');
-    let pdfBlob: Blob;
-    try {
-      pdfBlob = await htmlStringToPdfBlob(htmlText);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      throw new Error(`文书转 PDF 失败：${msg}`);
+    if (allAsignTemplateMode && selectedForAsign.length > 1) {
+      throw new Error(
+        '使用爱签模板创建合同时，暂仅支持选择一份文书；请去掉多余模板或分多次发起。',
+      );
     }
-    const base64 = await blobToBase64(pdfBlob);
+    if (allAsignTemplateMode && employeesFormData.length > 1) {
+      throw new Error(
+        '使用爱签模板创建合同时，暂仅支持一次选择一名员工；请分批发起。',
+      );
+    }
 
     const now = new Date();
     const yyyy = String(now.getFullYear());
@@ -2741,7 +2783,6 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
       .filter(Boolean)
       .join('_') || '未命名员工';
     const userId = profile?.id ?? 'unknown';
-    // 爱签 prev 环境限制 contractNo 最长 40（错误码 100577）；UUID+日期时间会超长，这里压缩为 ≤40 且仍含日期时间与用户标识片段
     const ASIGN_CONTRACT_NO_MAX = 40;
     const uuidCompact = String(userId).replace(/-/g, '');
     const contractNoBase = `U_${dateStr}_${timeStr}`;
@@ -2756,17 +2797,60 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
         contractNo = contractNo.slice(0, ASIGN_CONTRACT_NO_MAX);
       }
     }
-    const filenameRaw = `签署文书_${employeeNames}_${dateStr}.pdf`;
-    const filename = filenameRaw.replace(/[\\/:*?"<>|]/g, '_');
     const fullName = typeof (profile as any)?.full_name === 'string' ? (profile as any).full_name : '';
     const username = typeof (profile as any)?.username === 'string' ? (profile as any).username : '';
     const displayName = (fullName || username || 'unknown').trim();
-    const contractNameRaw = `${filename}_${displayName}_${userId}_${dateStr}`;
-    // 避免第三方对特殊字符不兼容
-    const contractName = contractNameRaw.replace(/[\\/:*?"<>|]/g, '_');
+    /** 爱签 contractName 最长 120，超长会报参数异常 */
+    const ASIGN_CONTRACT_NAME_MAX = 120;
+    const normalizeContractName = (raw: string) =>
+      raw.replace(/[\\/:*?"<>|]/g, '_').slice(0, ASIGN_CONTRACT_NAME_MAX);
 
-    const { data, error } = await supabase.functions.invoke('create-signing', {
-      body: {
+    let contractName: string;
+    let invokeBody: Record<string, unknown>;
+
+    if (allAsignTemplateMode && selectedForAsign.length === 1 && employeesFormData.length === 1) {
+      const docTemplate = selectedForAsign[0];
+      const emp = employeesFormData[0];
+      const fillData = buildAsignFillDataForContract(emp, finalCompanyFormData);
+      const rawName = (docTemplate.name || '文书').trim();
+      const fileName = rawName
+        .replace(/\.(pdf|docx?|doc)$/i, '')
+        .replace(/[\\/:*?"<>|]/g, '_')
+        .slice(0, 200);
+      const contractNameRaw = `爱签模板_${rawName}_${emp.name || '员工'}_${displayName}_${userId}_${dateStr}`;
+      contractName = normalizeContractName(contractNameRaw);
+      invokeBody = {
+        contractNo,
+        contractName,
+        ...(opts?.strangers?.length ? { strangers: opts.strangers } : {}),
+        templates: [
+          {
+            templateNo: String(docTemplate.asign_template_ident).trim(),
+            fileName: fileName || '文书',
+            fillData,
+          },
+        ],
+      };
+      toast.info('正在通过爱签模板创建待签署文件…');
+    } else {
+      if (!previewFileUrl) {
+        throw new Error('缺少预览文件，无法发起签署');
+      }
+      const htmlText = await getHtmlForSigningPdf();
+      toast.info('正在生成签署文件，请稍候…');
+      let pdfBlob: Blob;
+      try {
+        pdfBlob = await htmlStringToPdfBlob(htmlText);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        throw new Error(`文书转 PDF 失败：${msg}`);
+      }
+      const base64 = await blobToBase64(pdfBlob);
+      const filenameRaw = `签署文书_${employeeNames}_${dateStr}.pdf`;
+      const filename = filenameRaw.replace(/[\\/:*?"<>|]/g, '_');
+      const contractNameRaw = `${filename}_${displayName}_${userId}_${dateStr}`;
+      contractName = normalizeContractName(contractNameRaw);
+      invokeBody = {
         contractNo,
         contractName,
         ...(opts?.strangers?.length ? { strangers: opts.strangers } : {}),
@@ -2777,7 +2861,11 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
             base64,
           },
         ],
-      },
+      };
+    }
+
+    const { data, error } = await supabase.functions.invoke('create-signing', {
+      body: invokeBody,
     });
 
     if (error) {

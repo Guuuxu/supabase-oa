@@ -426,6 +426,20 @@ verify_jwt = true
 import_map = "./functions/sync-asign-templates/deno.json"
 entrypoint = "./functions/sync-asign-templates/index.ts"
 
+# 爱签：打开在线模板制作页（template/open）
+[functions.open-asign-template]
+enabled = true
+verify_jwt = true
+import_map = "./functions/open-asign-template/deno.json"
+entrypoint = "./functions/open-asign-template/index.ts"
+
+# 爱签：按模板编号查询已同步控件信息（template/getTemplateData）
+[functions.get-asign-template-data]
+enabled = true
+verify_jwt = true
+import_map = "./functions/get-asign-template-data/deno.json"
+entrypoint = "./functions/get-asign-template-data/index.ts"
+
 # 管理员创建用户（service_role + auth.admin.createUser，避免前端 signUp 抢占会话）
 [functions.admin-create-user]
 enabled = true

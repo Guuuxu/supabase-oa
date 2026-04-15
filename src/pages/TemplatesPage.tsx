@@ -53,15 +53,19 @@ import {
   updateDocumentTemplate,
   deleteDocumentTemplate,
   syncAsignTemplatesToDocumentTemplates,
+  openAsignTemplateDesigner,
+  getAsignTemplateData,
 } from '@/db/api';
+import { extractAsignTemplateControlHints } from '@/utils/extractAsignTemplateControlHints';
 import { DOCUMENT_CATEGORY_LABELS, DOCUMENT_CATEGORY_LABELS_WITH_UNIVERSAL, DOCUMENT_TEMPLATE_NAMES, DocumentCategoryWithUniversal } from '@/types/types';
 import type { DocumentTemplate, Company, DocumentCategory } from '@/types/types';
 import { toast } from 'sonner';
-import { Plus, Pencil, Trash2, Search, Check, ChevronsUpDown, X, CloudDownload } from 'lucide-react';
+import { Plus, Pencil, Trash2, Search, Check, ChevronsUpDown, X, CloudDownload, Loader2 } from 'lucide-react';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useAuth } from '@/contexts/AuthContext';
 import { cn } from '@/lib/utils';
 import { supabase } from '@/db/supabase';
+import { ScrollArea } from '@/components/ui/scroll-area';
 
 export default function TemplatesPage() {
   const { profile } = useAuth();
@@ -80,6 +84,8 @@ export default function TemplatesPage() {
     company_id: '',
     name: '',
     category: 'onboarding' as DocumentCategory,
+    asign_template_ident: '',
+    asign_template_type: null as number | null,
     content: '',
     requires_company_signature: false,
     is_universal: false
@@ -96,6 +102,14 @@ export default function TemplatesPage() {
     /** 请求 Edge 返回 diagnostic，并在控制台打印 */
     debug: false,
   });
+
+  /** 爱签 getTemplateData：查询控件 key 结果弹窗 */
+  const [templateMetaDialogOpen, setTemplateMetaDialogOpen] = useState(false);
+  const [templateMetaLoading, setTemplateMetaLoading] = useState(false);
+  const [templateMetaHints, setTemplateMetaHints] = useState<ReturnType<
+    typeof extractAsignTemplateControlHints
+  > | null>(null);
+  const [templateMetaRaw, setTemplateMetaRaw] = useState('');
 
   useEffect(() => {
     loadData();
@@ -120,6 +134,8 @@ export default function TemplatesPage() {
         company_id: template.company_id || '',
         name: template.name,
         category: template.category,
+        asign_template_ident: template.asign_template_ident || '',
+        asign_template_type: template.asign_template_type ?? null,
         content: template.content || '',
         requires_company_signature: template.requires_company_signature,
         is_universal: !template.company_id // company_id为null表示通用模板
@@ -130,6 +146,8 @@ export default function TemplatesPage() {
         company_id: (profile?.company_id || '') as string,
         name: '',
         category: selectedCategory,
+        asign_template_ident: '',
+        asign_template_type: null,
         content: '',
         requires_company_signature: false,
         is_universal: false
@@ -138,6 +156,97 @@ export default function TemplatesPage() {
     setUploadedFile(null);
     setDialogOpen(true);
   };
+
+  const onlineGenerate = async () => {
+    const templateIdent = editingTemplate?.asign_template_ident?.trim() || '';
+    const redirectUrl = window.location.href;
+    const result = await openAsignTemplateDesigner({
+      template_ident: templateIdent || undefined,
+      redirect_url: redirectUrl,
+      hidden_basic: 0,
+    });
+    if (!result.ok) {
+      console.error('[ASIGN_TEMPLATE_OPEN] 调用失败', result.detail, result.debug);
+      toast.error(result.error || '打开爱签模板页面失败');
+      return;
+    }
+    if (!result.open_url) {
+      console.error('[ASIGN_TEMPLATE_OPEN] 未返回可打开链接', result.data);
+      toast.error('未从爱签返回可打开的模板链接');
+      return;
+    }
+    window.open(result.open_url, '_blank', 'noopener,noreferrer');
+  };
+
+  const fetchAsignTemplateControls = async () => {
+    const templateIdent = formData.asign_template_ident.trim();
+    if (!templateIdent) {
+      toast.error('请先填写爱签模板编号');
+      return;
+    }
+    setTemplateMetaLoading(true);
+    try {
+      const res = await getAsignTemplateData({ template_ident: templateIdent });
+      if (!res.ok) {
+        console.error('[ASIGN_GET_TEMPLATE_DATA] 失败', res.detail, res.debug);
+        toast.error(res.error || '获取爱签模板控件失败');
+        return;
+      }
+      const hints = extractAsignTemplateControlHints(res.data);
+      setTemplateMetaHints(hints);
+      setTemplateMetaRaw(JSON.stringify(res.data, null, 2));
+      setTemplateMetaDialogOpen(true);
+      toast.success('已拉取爱签模板控件信息');
+    } finally {
+      setTemplateMetaLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    const sp = url.searchParams;
+    const templateIdent =
+      sp.get('templateIdent') ||
+      sp.get('template_ident') ||
+      sp.get('templateNo') ||
+      sp.get('template_no') ||
+      '';
+    if (!templateIdent) {
+      return;
+    }
+    const templateName =
+      sp.get('templateName') ||
+      sp.get('template_name') ||
+      sp.get('fileName') ||
+      sp.get('name') ||
+      '';
+
+    setEditingTemplate(null);
+    setFormData((prev) => ({
+      ...prev,
+      company_id: prev.company_id || ((profile?.company_id || '') as string),
+      name: templateName || prev.name || `爱签模板_${templateIdent}`,
+      asign_template_ident: templateIdent,
+      asign_template_type: prev.asign_template_type ?? null,
+      is_universal: false,
+    }));
+    setDialogOpen(true);
+    toast.success('已从爱签回填模板信息，请确认后保存');
+
+    const keysToClear = [
+      'templateIdent',
+      'template_ident',
+      'templateNo',
+      'template_no',
+      'templateName',
+      'template_name',
+      'fileName',
+      'name',
+    ];
+    keysToClear.forEach((k) => sp.delete(k));
+    const next = `${url.pathname}${sp.toString() ? `?${sp.toString()}` : ''}${url.hash || ''}`;
+    window.history.replaceState({}, '', next);
+  }, [profile]);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -390,7 +499,9 @@ export default function TemplatesPage() {
                 <Plus className="mr-2 h-4 w-4" />
                 添加模板
               </Button>
+              
             </DialogTrigger>
+            
             <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
               <form onSubmit={handleSubmit}>
                 <DialogHeader>
@@ -496,38 +607,59 @@ export default function TemplatesPage() {
                     />
                   </div>
                   <div className="space-y-2">
-                    <Label htmlFor="file">模板附件</Label>
-                    <div className="space-y-2">
-                      <Input
-                        id="file"
-                        type="file"
-                        accept=".doc,.docx,.pdf,.xls,.xlsx"
-                        onChange={handleFileChange}
-                        className="cursor-pointer"
-                      />
-                      <p className="text-xs text-muted-foreground">
-                        支持 Word、PDF、Excel 格式，不限制文件大小
-                      </p>
-                      {uploadedFile && (
-                        <div className="flex items-center gap-2 text-sm text-primary">
-                          <Check className="h-4 w-4" />
-                          <span>已选择：{uploadedFile.name}</span>
-                        </div>
-                      )}
-                      {formData.content && !uploadedFile && (
-                        <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                          <Check className="h-4 w-4" />
-                          <a 
-                            href={formData.content} 
-                            target="_blank" 
-                            rel="noopener noreferrer"
-                            className="hover:underline"
-                          >
-                            查看当前附件
-                          </a>
-                        </div>
-                      )}
+                    <Label htmlFor="asign_template_ident">爱签模板编号</Label>
+                    <Input
+                      id="asign_template_ident"
+                      value={formData.asign_template_ident}
+                      onChange={(e) =>
+                        setFormData({
+                          ...formData,
+                          asign_template_ident: e.target.value.trim(),
+                        })
+                      }
+                      placeholder="例如 TNB...；制作完成回跳后会自动回填"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      填写编号后可点击「查询控件/key」，调用爱签{' '}
+                      <code className="rounded bg-muted px-1">template/getTemplateData</code>
+                      ，对照返回中的 dataKey / 签署位 key 配置模板。
+                    </p>
+                    <div className="flex flex-wrap gap-2">
+                      <Button type="button" variant="secondary" onClick={() => onlineGenerate()}>
+                        <Plus className="mr-2 h-4 w-4" />
+                        制作模板
+                      </Button>
+                      {/* <Button
+                        type="button"
+                        variant="outline"
+                        disabled={templateMetaLoading}
+                        onClick={() => void fetchAsignTemplateControls()}
+                      >
+                        {templateMetaLoading ? (
+                          <>
+                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                            查询中…
+                          </>
+                        ) : (
+                          <>
+                            <Search className="mr-2 h-4 w-4" />
+                            查询控件/key
+                          </>
+                        )}
+                      </Button> */}
                     </div>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="file">模板附件</Label>
+                    <Input
+                      id="file"
+                      type="file"
+                      accept=".pdf,.doc,.docx,.xls,.xlsx,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                      onChange={handleFileChange}
+                    />
+                    {uploadedFile ? (
+                      <p className="text-xs text-muted-foreground">已选择：{uploadedFile.name}</p>
+                    ) : null}
                   </div>
                   <div className="flex items-center space-x-2">
                     <Checkbox
@@ -551,6 +683,63 @@ export default function TemplatesPage() {
                   </Button>
                 </DialogFooter>
               </form>
+            </DialogContent>
+          </Dialog>
+
+          <Dialog open={templateMetaDialogOpen} onOpenChange={setTemplateMetaDialogOpen}>
+            <DialogContent className="max-w-2xl max-h-[85vh] flex flex-col">
+              <DialogHeader>
+                <DialogTitle>爱签模板控件 / key</DialogTitle>
+                <DialogDescription>
+                  来源：爱签 <code className="rounded bg-muted px-1">template/getTemplateData</code>
+                  。下方「可能用于填充 / 签署」由返回 JSON 自动提取，字段名因爱签版本可能略有差异，请以控制台为准。
+                </DialogDescription>
+              </DialogHeader>
+              <div className="space-y-4 py-2 overflow-y-auto flex-1 min-h-0">
+                {templateMetaHints ? (
+                  <>
+                    <div className="space-y-2">
+                      <p className="text-sm font-medium">可能对应 fillData（dataKey 等）</p>
+                      {templateMetaHints.fillDataKeys.length ? (
+                        <div className="flex flex-wrap gap-1">
+                          {templateMetaHints.fillDataKeys.map((k) => (
+                            <Badge key={`f-${k}`} variant="secondary">
+                              {k}
+                            </Badge>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-xs text-muted-foreground">未从返回中解析到常见填充字段，请查看底部原始 JSON。</p>
+                      )}
+                    </div>
+                    <div className="space-y-2">
+                      <p className="text-sm font-medium">可能对应签署位（signKey 等）</p>
+                      {templateMetaHints.signKeys.length ? (
+                        <div className="flex flex-wrap gap-1">
+                          {templateMetaHints.signKeys.map((k) => (
+                            <Badge key={`s-${k}`} variant="outline">
+                              {k}
+                            </Badge>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-xs text-muted-foreground">未从返回中解析到常见签署 key，请查看底部原始 JSON。</p>
+                      )}
+                    </div>
+                  </>
+                ) : null}
+                <div className="space-y-2">
+                  <p className="text-sm font-medium">原始返回（JSON）</p>
+                  <ScrollArea className="h-[220px] w-full rounded-md border p-2">
+                    <pre className="text-xs whitespace-pre-wrap break-all font-mono">{templateMetaRaw || '—'}</pre>
+                  </ScrollArea>
+                </div>
+              </div>
+              <DialogFooter>
+                <Button type="button" variant="secondary" onClick={() => setTemplateMetaDialogOpen(false)}>
+                  关闭
+                </Button>
+              </DialogFooter>
             </DialogContent>
           </Dialog>
           </div>

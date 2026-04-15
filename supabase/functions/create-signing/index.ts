@@ -9,6 +9,8 @@
  *
  * 自建 Supabase：Edge 默认 CPU 极低（约 50ms/100ms 量级），大 PDF 勿用 JSON 内嵌 base64，
  * 请走前端 upload + contractFileStorage；或调整 edge-runtime 的 cpuTimeSoftLimitMs / cpuTimeHardLimitMs。
+ *
+ * 亦支持爱签「templates」创建（与 contractFiles / contractFileStorage 二选一）：bizData.templates[] 含 templateNo、fileName、fillData 等。
  */
 import { serve } from "https://deno.land/std/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -33,6 +35,18 @@ type CreateSigningStranger = {
   creditCode?: string;
 };
 
+/** 爱签「创建待签署文件」templates[] 单项：与开放平台字段 templateNo、fileName、fillData 等对齐 */
+type CreateSigningAsignTemplateItem = {
+  templateNo: string;
+  /** 展示名，勿带扩展名 */
+  fileName?: string;
+  contractNo?: string;
+  /** 单行/多行/日期等：key 为爱签模板控件 dataKey，value 为填入内容 */
+  fillData?: Record<string, unknown>;
+  componentData?: unknown[];
+  tableDatas?: unknown[];
+};
+
 type CreateSigningBody = {
   user_id?: string;
   document_id?: string;
@@ -51,6 +65,12 @@ type CreateSigningBody = {
   callbackUrl?: string;
   needAgree?: number;
   signOrder?: number;
+
+  /**
+   * 与爱签 createContract 的 templates 二选一：与 contractFiles / contractFileStorage 勿同时使用。
+   * 每项须含 templateNo；fillData 为 Map 结构（JSON 对象）。
+   */
+  templates?: CreateSigningAsignTemplateItem[];
 
   /** 优先：请求体极小，PDF 由 service_role 从 Storage 下载为 bytes，避免 JSON 内嵌 base64 触发 Edge CPU hard limit */
   contractFileStorage?: {
@@ -157,6 +177,9 @@ function bizDataRecordLikeNodeDemo(body: CreateSigningBody): Record<string, unkn
     needAgree: body.needAgree ?? 0,
     signOrder: body.signOrder ?? 1,
   };
+  if (Array.isArray(body.templates) && body.templates.length > 0) {
+    raw.templates = body.templates;
+  }
   const filtered: Record<string, unknown> = {};
   for (const key of Object.keys(raw)) {
     const v = raw[key];
@@ -194,7 +217,7 @@ async function loadContractFilesFromStorage(
 }
 
 async function callAsignCreateContract(body: CreateSigningBody) {
-  const bizDataInput = {
+  const bizDataInput: Record<string, unknown> = {
     validityTime: body.validityTime ?? 30,
     autoContinue: body.autoContinue ?? 0,
     readSeconds: body.readSeconds ?? 2,
@@ -206,14 +229,17 @@ async function callAsignCreateContract(body: CreateSigningBody) {
     contractName: body.contractName,
     needAgree: body.needAgree ?? 0,
     signOrder: body.signOrder ?? 1,
-  } as const;
+  };
+  if (Array.isArray(body.templates) && body.templates.length > 0) {
+    bizDataInput.templates = body.templates;
+  }
 
   return callAsignFormPost({
     path: "contract/createContract",
-    bizDataInput: { ...bizDataInput },
+    bizDataInput,
     keepEmptyStringKeys: ["redirectUrl", "notifyUrl", "callbackUrl"],
     strictBizDataOverride: bizDataRecordLikeNodeDemo(body),
-    contractFiles: body.contractFiles,
+    contractFiles: body.contractFiles?.length ? body.contractFiles : undefined,
   });
 }
 
@@ -249,11 +275,31 @@ serve(async (req) => {
 
     const hasStorage = Boolean(body.contractFileStorage);
     const hasEmbedded = Boolean(body.contractFiles?.length);
-    if (!hasStorage && !hasEmbedded) {
-      return json({ error: "缺少合同 PDF：请传 contractFileStorage 或 contractFiles" }, 400);
+    const hasTemplates = Array.isArray(body.templates) && body.templates.length > 0;
+
+    if (!hasStorage && !hasEmbedded && !hasTemplates) {
+      return json(
+        {
+          error: "缺少待签署来源：请传 contractFileStorage、contractFiles 或 templates（爱签模板）之一",
+        },
+        400,
+      );
+    }
+    if (hasTemplates && (hasStorage || hasEmbedded)) {
+      return json({ error: "爱签 templates 与上传文件二选一，请勿同时传" }, 400);
     }
     if (hasStorage && hasEmbedded) {
       return json({ error: "请勿同时传 contractFileStorage 与 contractFiles" }, 400);
+    }
+
+    if (hasTemplates) {
+      for (let i = 0; i < body.templates.length; i += 1) {
+        const row = body.templates[i];
+        const no = String(row?.templateNo ?? "").trim();
+        if (!no) {
+          return json({ error: `templates[${i}] 缺少 templateNo` }, 400);
+        }
+      }
     }
 
     let contractFiles: AsignContractFile[] | undefined;
@@ -277,11 +323,17 @@ serve(async (req) => {
         const detail = e instanceof Error ? e.message : String(e);
         return json({ ok: false, error: "从 Storage 读取 PDF 失败", detail }, 200);
       }
-    } else {
+    } else if (hasEmbedded) {
       contractFiles = body.contractFiles;
+    } else {
+      contractFiles = undefined;
     }
 
-    const bodyForAsign: CreateSigningBody = { ...body, contractFiles };
+    const bodyForAsign: CreateSigningBody = {
+      ...body,
+      contractFiles,
+      ...(hasTemplates ? { templates: body.templates } : {}),
+    };
 
     const strangersRaw = Array.isArray(body.strangers) ? body.strangers : [];
     const seenStrangerAccounts = new Set<string>();
