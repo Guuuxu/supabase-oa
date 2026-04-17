@@ -489,10 +489,10 @@ export default function TemplatesPage() {
             <p className="text-muted-foreground mt-2">管理各类人力资源文书模板</p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <Button type="button" variant="secondary" onClick={openSyncAsignDialog}>
+            {/* <Button type="button" variant="secondary" onClick={openSyncAsignDialog}>
               <CloudDownload className="mr-2 h-4 w-4" />
               从爱签同步模板
-            </Button>
+            </Button> */}
             <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
             <DialogTrigger asChild>
               <Button onClick={() => handleOpenDialog()}>

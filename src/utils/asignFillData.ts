@@ -92,6 +92,12 @@ export function buildAsignFillDataForContract(
     日期: currentDateIso,
     日期文本: currentDateCn,
     当前日期: currentDateIso,
+    /** 与控制台常见 dataKey 对齐，避免仅模板里有「签署日期」等键时 fillData 对不上 */
+    签署日期: currentDateIso,
+    签订日期: currentDateIso,
+    生效日期: currentDateIso,
+    签约日期: currentDateIso,
+    文书日期: currentDateIso,
   };
 
   const out: Record<string, string> = {};

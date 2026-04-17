@@ -65,6 +65,7 @@ import {
   updateSigningRecordFile,
   downloadAsignContractAndSyncArchive,
   addAsignSignatory,
+  getAsignTemplateData,
   type AsignAddSignerItem,
   type AsignSignStrategyItem,
 } from '@/db/api';
@@ -78,6 +79,16 @@ import { cn } from '@/lib/utils';
 import { supabase } from '@/db/supabase';
 import { htmlStringToPdfBlob } from '@/utils/htmlToPdf';
 import { buildAsignFillDataForContract } from '@/utils/asignFillData';
+import {
+  enrichFillDataWithTemplateDateKeys,
+  filterAsignFillDataByTemplateDataKeys,
+} from '@/utils/asignTemplateFillFilter';
+import {
+  extractAsignTemplateControlHints,
+  mergeTemplateDateSignKeysForAddSigner,
+  pickAsignPartyBMainSignKey,
+  type AsignTemplateControlHints,
+} from '@/utils/extractAsignTemplateControlHints';
 
 export default function SigningsPage() {
   const { profile } = useAuth();
@@ -2516,7 +2527,9 @@ export default function SigningsPage() {
     options?: {
       appendCompany?: typeof finalCompanyFormData;
       contractAttachNo?: number;
-    }
+      /** 由 getTemplateData 实时解析；爱签模板发起时必传，签署策略与模板控件一致 */
+      asignTemplateHints?: AsignTemplateControlHints;
+    },
   ): AsignAddSignerItem[] => {
     const attachNo = options?.contractAttachNo ?? 1;
 
@@ -2536,56 +2549,109 @@ export default function SigningsPage() {
       1,
     );
 
-    /** 甲方：模板坐标 locationMode=4，signKey 须与爱签模板中甲方签署位关键字一致 */
-    const strategyPartyA: AsignSignStrategyItem[] = [
-      {
-        attachNo,
-        locationMode: 4,
-        signType: 1,
-        signKey: '甲方',
-      },
-    ];
-    /** 乙方（员工/个人）：模板坐标 locationMode=4，signKey 须与模板中乙方签署位关键字一致 */
-    /**
-     * 爱签 addSigner 会校验 signKey 必须在模板中存在；多传不存在的 key 会报 100617。
-     * 默认只传「当前日期」；若某模板日期位 key 不同，在 .env 设置 VITE_ASIGN_DATE_SIGN_KEYS=签署日期,签约日期（逗号分隔）。
-     * 若模板还有其它个人侧签署位，用 VITE_ASIGN_PARTY_B_EXTRA_SIGN_KEYS（逗号分隔，且模板须真实存在）。
-     */
-    const dateSignKeysFromEnv = (import.meta.env.VITE_ASIGN_DATE_SIGN_KEYS ?? '当前日期')
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const dateSignKeysBase = dateSignKeysFromEnv.length > 0 ? dateSignKeysFromEnv : ['当前日期'];
-    const dateSignKeys = Array.from(new Set(dateSignKeysBase));
-    /**
-     * 个人侧「除签名、日期外」的额外签署位（如模板里单独放了手写抄录区），须与模板 signKey 完全一致。
-     * 默认不传；需要时在 .env 设置 VITE_ASIGN_PARTY_B_EXTRA_SIGN_KEYS=乙方,身份证号（逗号分隔）。
-     */
-    const extraPartyBSignKeysRaw = (import.meta.env.VITE_ASIGN_PARTY_B_EXTRA_SIGN_KEYS ?? '')
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const extraPartyBSignKeys = Array.from(new Set(extraPartyBSignKeysRaw));
-    const strategyPartyB: AsignSignStrategyItem[] = [
-      {
-        attachNo,
-        locationMode: 4,
-        signType: 1,
-        signKey: '个人',
-      },
-      ...dateSignKeys.map((key) => ({
-        attachNo,
-        locationMode: 4 as const,
-        signType: 2 as const,
-        signKey: key,
-      })),
-      ...extraPartyBSignKeys.map((key) => ({
-        attachNo,
-        locationMode: 4 as const,
-        signType: 1 as const,
-        signKey: key,
-      })),
-    ];
+    const hints = options?.asignTemplateHints;
+    let strategyPartyA: AsignSignStrategyItem[];
+    let strategyPartyB: AsignSignStrategyItem[];
+
+    if (hints) {
+      const signKeySet = new Set(hints.signKeys.map((s) => s.trim()).filter(Boolean));
+      if (signKeySet.size === 0) {
+        throw new Error('爱签模板未返回签署位信息（signKey），无法添加签署方。');
+      }
+      const company = options?.appendCompany;
+      if (company && (company.name || '').trim() && !signKeySet.has('甲方')) {
+        throw new Error(
+          `所选文书需要企业盖章，但爱签模板中未找到「甲方」签署位。模板签署位：${hints.signKeys.join('、')}`,
+        );
+      }
+      const mainB = pickAsignPartyBMainSignKey(hints.signKeys);
+      if (!mainB) {
+        throw new Error(
+          `爱签模板中未找到个人签署位（依次尝试：个人、乙方、员工等）。模板签署位：${hints.signKeys.join('、')}`,
+        );
+      }
+      const dateKeysOrdered = mergeTemplateDateSignKeysForAddSigner({
+        signKeys: hints.signKeys,
+        mainPartyBSignKey: mainB,
+        timestampSignKeys: hints.timestampSignKeys,
+      });
+
+      const extraPartyBSignKeysRaw = (import.meta.env.VITE_ASIGN_PARTY_B_EXTRA_SIGN_KEYS ?? '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const extraPartyBSignKeys = Array.from(new Set(extraPartyBSignKeysRaw));
+      const extrasFiltered = extraPartyBSignKeys.filter(
+        (k) => signKeySet.has(k) && k !== mainB && !dateKeysOrdered.includes(k),
+      );
+
+      strategyPartyA = [{ attachNo, locationMode: 4, signType: 1, signKey: '甲方' }];
+      strategyPartyB = [
+        { attachNo, locationMode: 4, signType: 1, signKey: mainB },
+        ...dateKeysOrdered.map((key) => ({
+          attachNo,
+          locationMode: 4 as const,
+          signType: 2 as const,
+          signKey: key,
+        })),
+        ...extrasFiltered.map((key) => ({
+          attachNo,
+          locationMode: 4 as const,
+          signType: 1 as const,
+          signKey: key,
+        })),
+      ];
+    } else {
+      /** 甲方：非爱签模板路径（如 HTML 转 PDF）仍沿用固定关键字 */
+      strategyPartyA = [
+        {
+          attachNo,
+          locationMode: 4,
+          signType: 1,
+          signKey: '甲方',
+        },
+      ];
+      /**
+       * 爱签 addSigner 会校验 signKey 必须在模板中存在；多传不存在的 key 会报 100617。
+       * 非「爱签模板 + getTemplateData」路径：沿用环境变量；未配置时默认「当前日期」以兼容历史 PDF 流程。
+       */
+      const dateSignKeysEnvRaw = import.meta.env.VITE_ASIGN_DATE_SIGN_KEYS;
+      const dateSignKeys = Array.from(
+        new Set(
+          dateSignKeysEnvRaw === undefined
+            ? ['当前日期']
+            : String(dateSignKeysEnvRaw)
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean),
+        ),
+      );
+      const extraPartyBSignKeysRaw = (import.meta.env.VITE_ASIGN_PARTY_B_EXTRA_SIGN_KEYS ?? '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const extraPartyBSignKeys = Array.from(new Set(extraPartyBSignKeysRaw));
+      strategyPartyB = [
+        {
+          attachNo,
+          locationMode: 4,
+          signType: 1,
+          signKey: '个人',
+        },
+        ...dateSignKeys.map((key) => ({
+          attachNo,
+          locationMode: 4 as const,
+          signType: 2 as const,
+          signKey: key,
+        })),
+        ...extraPartyBSignKeys.map((key) => ({
+          attachNo,
+          locationMode: 4 as const,
+          signType: 1 as const,
+          signKey: key,
+        })),
+      ];
+    }
 
     const employeeItems: AsignAddSignerItem[] = [];
     for (const emp of employeeRows) {
@@ -2744,6 +2810,16 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
       companyName?: string;
       creditCode?: string;
     }>;
+    /**
+     * 多份爱签模板时由调用方循环传入：每轮一单 createContract。
+     * 单份模板多人签署一份合同时勿传，由下方逻辑用「首位员工」填充模板正文控件。
+     */
+    asignRound?: {
+      docTemplate: DocumentTemplate;
+      fillEmployee: EmployeeFormData;
+      /** 拼进 contractNo，避免连发撞号 */
+      contractNoNonce?: string;
+    };
   }) => {
     const selectedForAsign = templates.filter((t) => formData.template_ids.includes(t.id));
     const hasAsignIdent = (t: DocumentTemplate) => Boolean((t.asign_template_ident || '').trim());
@@ -2757,16 +2833,6 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
         '所选文书不能混用「爱签模板」（已填模板编号）与普通文书，请只选一类后再发起。',
       );
     }
-    if (allAsignTemplateMode && selectedForAsign.length > 1) {
-      throw new Error(
-        '使用爱签模板创建合同时，暂仅支持选择一份文书；请去掉多余模板或分多次发起。',
-      );
-    }
-    if (allAsignTemplateMode && employeesFormData.length > 1) {
-      throw new Error(
-        '使用爱签模板创建合同时，暂仅支持一次选择一名员工；请分批发起。',
-      );
-    }
 
     const now = new Date();
     const yyyy = String(now.getFullYear());
@@ -2777,7 +2843,8 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
     const mi = String(now.getMinutes()).padStart(2, '0');
     const ss = String(now.getSeconds()).padStart(2, '0');
     const ms = String(now.getMilliseconds()).padStart(3, '0');
-    const timeStr = `${hh}${mi}${ss}${ms}`;
+    const nonceRaw = (opts?.asignRound?.contractNoNonce || '').replace(/[^a-zA-Z0-9]/g, '').slice(0, 10);
+    const timeStr = nonceRaw ? `${hh}${mi}${ss}${ms}_${nonceRaw}` : `${hh}${mi}${ss}${ms}`;
     const employeeNames = employeesFormData
       .map((e) => (e.name || '').trim())
       .filter(Boolean)
@@ -2807,17 +2874,60 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
 
     let contractName: string;
     let invokeBody: Record<string, unknown>;
+    let asignTemplateHints: AsignTemplateControlHints | undefined;
 
-    if (allAsignTemplateMode && selectedForAsign.length === 1 && employeesFormData.length === 1) {
-      const docTemplate = selectedForAsign[0];
-      const emp = employeesFormData[0];
-      const fillData = buildAsignFillDataForContract(emp, finalCompanyFormData);
+    if (allAsignTemplateMode) {
+      let docTemplate: DocumentTemplate | null = null;
+      if (opts?.asignRound?.docTemplate) {
+        docTemplate = opts.asignRound.docTemplate;
+      } else if (selectedForAsign.length === 1) {
+        docTemplate = selectedForAsign[0];
+      }
+      let fillEmp: EmployeeFormData | null = null;
+      if (opts?.asignRound?.fillEmployee) {
+        fillEmp = opts.asignRound.fillEmployee;
+      } else if (employeesFormData.length > 0) {
+        fillEmp = employeesFormData[0];
+      }
+      if (!docTemplate || !fillEmp) {
+        throw new Error('爱签模板发起失败：缺少文书或员工信息。');
+      }
+      if (!opts?.asignRound && selectedForAsign.length > 1) {
+        throw new Error(
+          '多份爱签文书须按份逐单创建，请使用发起流程中的分批逻辑；若仍看到本提示请联系管理员。',
+        );
+      }
+      const tid = String(docTemplate.asign_template_ident).trim();
+      const tdRes = await getAsignTemplateData({ template_ident: tid });
+      if (!tdRes.ok) {
+        throw new Error(tdRes.error || '获取爱签模板控件信息失败，请稍后重试或联系管理员。');
+      }
+      asignTemplateHints = extractAsignTemplateControlHints(tdRes.data);
+      if (asignTemplateHints.signKeys.length === 0) {
+        throw new Error(
+          '未能从爱签模板中解析出签署位（signKey）。请在文书模板管理页用「查询控件」核对模板，或联系管理员。',
+        );
+      }
+      const fillCore = buildAsignFillDataForContract(fillEmp, finalCompanyFormData);
+      let fillData =
+        asignTemplateHints.fillDataKeys.length > 0
+          ? filterAsignFillDataByTemplateDataKeys(fillCore, asignTemplateHints.fillDataKeys)
+          : fillCore;
+      if (asignTemplateHints.fillDataKeys.length > 0) {
+        fillData = enrichFillDataWithTemplateDateKeys(
+          fillCore,
+          asignTemplateHints.fillDataKeys,
+          asignTemplateHints.signKeys,
+          fillData,
+        );
+      }
       const rawName = (docTemplate.name || '文书').trim();
       const fileName = rawName
         .replace(/\.(pdf|docx?|doc)$/i, '')
         .replace(/[\\/:*?"<>|]/g, '_')
         .slice(0, 200);
-      const contractNameRaw = `爱签模板_${rawName}_${emp.name || '员工'}_${displayName}_${userId}_${dateStr}`;
+      const nameForTitle = (fillEmp.name || '').trim() || '员工';
+      const contractNameRaw = `爱签模板_${rawName}_${employeeNames || nameForTitle}_${displayName}_${userId}_${dateStr}`;
       contractName = normalizeContractName(contractNameRaw);
       invokeBody = {
         contractNo,
@@ -2886,7 +2996,7 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
 
     const effectiveContractNo = extractContractNoFromCreateSigningResponse(data, contractNo);
 
-    return { contractNo, effectiveContractNo, contractName, asign: data };
+    return { contractNo, effectiveContractNo, contractName, asign: data, asignTemplateHints };
   };
 
   const handleViewDetail = (signing: SigningRecord) => {
@@ -4016,6 +4126,112 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                             }
                           }
 
+                          const hasAsignIdentForBatch = (t: DocumentTemplate) =>
+                            Boolean((t.asign_template_ident || '').trim());
+                          const allAsignTemplateModeForBatch =
+                            selectedTemplatesForAsign.length > 0 &&
+                            selectedTemplatesForAsign.every(hasAsignIdentForBatch);
+
+                          /** 多份爱签模板：每人每份文书一单合同（一人多合同、多人多份每人一套） */
+                          if (
+                            allAsignTemplateModeForBatch &&
+                            selectedTemplatesForAsign.length > 1
+                          ) {
+                            let batchIndex = 0;
+                            const totalRounds =
+                              selectedTemplatesForAsign.length * employeesFormData.length;
+                            for (const docTemplate of selectedTemplatesForAsign) {
+                              for (const emp of employeesFormData) {
+                                batchIndex += 1;
+                                toast.info(
+                                  `正在创建爱签合同（${batchIndex}/${totalRounds}）…`,
+                                );
+                                const strangersOne = buildAsignStrangersForCreateSigning(
+                                  [emp],
+                                  needsCompanySigner ? finalCompanyFormData : undefined,
+                                );
+                                const result = await invokeCreateSigning({
+                                  strangers: strangersOne,
+                                  asignRound: {
+                                    docTemplate,
+                                    fillEmployee: emp,
+                                    contractNoNonce: `b${batchIndex}`,
+                                  },
+                                });
+                                const contractNoForRound = result.effectiveContractNo;
+                                const asignRoundData: any = result.asign;
+                                const thirdPartySigningIdRound =
+                                  asignRoundData?.contractId ??
+                                  asignRoundData?.contract_id ??
+                                  asignRoundData?.data?.contractId ??
+                                  asignRoundData?.data?.contract_id ??
+                                  asignRoundData?.asign?.contractId ??
+                                  asignRoundData?.asign?.contract_id ??
+                                  undefined;
+                                const contractAttachNoRound =
+                                  getAsignCreateContractAttachNo(result.asign);
+                                const signersRound = buildAsignAddSignerItemsForEmployees(
+                                  [emp],
+                                  {
+                                    appendCompany: needsCompanySigner
+                                      ? finalCompanyFormData
+                                      : undefined,
+                                    contractAttachNo: contractAttachNoRound,
+                                    asignTemplateHints: result.asignTemplateHints,
+                                  },
+                                );
+                                if (signersRound.length === 0) {
+                                  throw new Error(
+                                    '无法添加签署方：请确认员工手机号与企业联系电话已填写（noticeMobile）',
+                                  );
+                                }
+                                const addSignResRound = await addAsignSignatory({
+                                  contractNo: contractNoForRound,
+                                  signers: signersRound,
+                                });
+                                if (!addSignResRound.success) {
+                                  throw new Error(
+                                    addSignResRound.error || '添加签署方失败',
+                                  );
+                                }
+                                const rec = await createSigningRecord({
+                                  company_id: formData.company_id,
+                                  employee_id: emp.id,
+                                  template_ids: [docTemplate.id],
+                                  status: 'pending' as SigningStatus,
+                                  signing_mode: formData.signing_mode,
+                                  third_party_contract_no: contractNoForRound,
+                                  third_party_contract_name: result.contractName,
+                                  third_party_signing_id: thirdPartySigningIdRound,
+                                  notes: formData.notes?.trim() ? formData.notes : undefined,
+                                  created_by: profile?.id,
+                                  employee_form_data: emp,
+                                  company_form_data: finalCompanyFormData,
+                                });
+                                if (!rec) {
+                                  throw new Error(
+                                    `签署记录创建失败（文书：${docTemplate.name || docTemplate.id}，员工：${emp.name || emp.id}）。`,
+                                  );
+                                }
+                              }
+                            }
+                            toast.success(
+                              `签署发起成功！已创建 ${totalRounds} 笔爱签合同（${selectedTemplatesForAsign.length} 份文书 × ${employeesFormData.length} 名员工）。`,
+                              {
+                                description:
+                                  '每位员工每份文书对应独立合同号；请留意短信签署链接。',
+                                duration: 6000,
+                              },
+                            );
+                            await loadData();
+                            setDialogOpen(false);
+                            if (previewFileUrl && previewFileUrl.startsWith('blob:')) {
+                              URL.revokeObjectURL(previewFileUrl);
+                              setPreviewFileUrl('');
+                            }
+                            return;
+                          }
+
                           const strangers = buildAsignStrangersForCreateSigning(
                             employeesFormData,
                             needsCompanySigner ? finalCompanyFormData : undefined,
@@ -4040,6 +4256,7 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                           const signers = buildAsignAddSignerItemsForEmployees(employeesFormData, {
                             appendCompany: needsCompanySigner ? finalCompanyFormData : undefined,
                             contractAttachNo,
+                            asignTemplateHints: result.asignTemplateHints,
                           });
                           if (signers.length === 0) {
                             throw new Error(

@@ -10,7 +10,7 @@ import { callAsignFormPost, isAsignBizSuccessResponse } from "../_shared/asign-c
 import { corsHeaders } from "../_shared/cors.ts";
 
 const LOG = "[GET_ASIGN_TEMPLATE_DATA]";
-const FN_VERSION = "2026-04-15-get-template-data-v1";
+const FN_VERSION = "2026-04-16-get-template-data-signing-initiate-v1";
 
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -48,9 +48,16 @@ serve(async (req) => {
     user_id: callerId,
     permission_code: "template_create",
   });
-  if (permErr) return json({ ok: false, error: "权限校验失败", version: FN_VERSION }, 500);
-  if (!isSuper && !canCreate) {
-    return json({ ok: false, error: "无文书模板管理权限", version: FN_VERSION }, 403);
+  const { data: canInitiateSigning, error: signPermErr } = await admin.rpc("has_permission", {
+    user_id: callerId,
+    permission_code: "signing_initiate",
+  });
+  if (permErr || signPermErr) return json({ ok: false, error: "权限校验失败", version: FN_VERSION }, 500);
+  if (!isSuper && !canCreate && !canInitiateSigning) {
+    return json(
+      { ok: false, error: "无权限：需要「发起签署」或「文书模板管理」权限之一", version: FN_VERSION },
+      403,
+    );
   }
 
   let body: { template_ident?: string };
