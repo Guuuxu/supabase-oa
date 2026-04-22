@@ -15,6 +15,7 @@ export type AsignContractFillCompany = {
   contact_person: string;
   contact_phone: string;
   legal_representative: string;
+  payday_date: string | number;
 };
 
 export type AsignContractFillEmployee = {
@@ -59,6 +60,34 @@ export function buildAsignFillDataForContract(
   const currentDateCn = `${yyyy}年${m}月${d}日`;
   const employeeName = (employeeData.name || '').trim();
   const companyName = (companyData.name || '').trim();
+  const hireDate = (employeeData.hire_date || '').trim();
+  const hireDateObj = new Date(hireDate);
+  const hireDateValid = !Number.isNaN(hireDateObj.getTime());
+  const hireDateYear = hireDateValid ? String(hireDateObj.getFullYear()) : '';
+  const hireDateMonth = hireDateValid ? String(hireDateObj.getMonth() + 1) : '';
+  const hireDateDay = hireDateValid ? String(hireDateObj.getDate()) : '';
+  const hireDateCn =
+    hireDateYear && hireDateMonth && hireDateDay
+      ? `${hireDateYear}年${hireDateMonth}月${hireDateDay}日`
+      : '';
+  const contractStartDate = (employeeData.contract_start_date || '').trim();
+  const contractStartDateObj = new Date(contractStartDate);
+  const contractStartDateValid = !Number.isNaN(contractStartDateObj.getTime());
+  const contractStartDateYear = contractStartDateValid ? String(contractStartDateObj.getFullYear()) : '';
+  const contractStartDateMonth = contractStartDateValid ? String(contractStartDateObj.getMonth() + 1) : '';
+  const contractStartDateDay = contractStartDateValid ? String(contractStartDateObj.getDate()) : '';
+  const contractEndDate = (employeeData.contract_end_date || '').trim();
+  const contractEndDateObj = new Date(contractEndDate);
+  const contractEndDateValid = !Number.isNaN(contractEndDateObj.getTime());
+  const contractEndDateYear = contractEndDateValid ? String(contractEndDateObj.getFullYear()) : '';
+  const contractEndDateMonth = contractEndDateValid ? String(contractEndDateObj.getMonth() + 1) : '';
+  const contractEndDateDay = contractEndDateValid ? String(contractEndDateObj.getDate()) : '';
+  const contractEndDateCn =
+    contractEndDateYear && contractEndDateMonth && contractEndDateDay
+      ? `${contractEndDateYear}年${contractEndDateMonth}月${contractEndDateDay}日`
+      : '';
+  
+  const paydayDate = (companyData.payday_date || '');
 
   const core: Record<string, string> = {
     /** 与 SigningsPage 里甲方 signKey「甲方」对应，供模板文本域 dataKey 使用 */
@@ -68,6 +97,7 @@ export function buildAsignFillDataForContract(
     /** 劳动/协议类模板常见「乙方」dataKey */
     乙方: employeeName,
     员工姓名: employeeName,
+    性别:  (employeeData.gender || '').trim(),
     身份证号: (employeeData.id_card || '').trim(),
     手机号: (employeeData.phone || '').trim(),
     邮箱: (employeeData.email || '').trim(),
@@ -75,12 +105,18 @@ export function buildAsignFillDataForContract(
     岗位: (employeeData.position || '').trim(),
     入职日期: (employeeData.hire_date || '').trim(),
     合同开始日期: (employeeData.contract_start_date || '').trim(),
+    合同开始年份: contractStartDateYear,
+    合同开始月份: contractStartDateMonth,
+    合同开始日: contractStartDateDay,
     合同结束日期: (employeeData.contract_end_date || '').trim(),
+    合同结束年份: contractEndDateYear,
+    合同结束月份: contractEndDateMonth,
+    合同结束日: contractEndDateDay,
     地址: (employeeData.address || '').trim(),
     证件类型: (employeeData.id_card_type || '').trim(),
-    性别: (employeeData.gender || '').trim(),
     出生日期: (employeeData.birth_date || '').trim(),
     参保时间: (employeeData.insurance_start_date || '').trim(),
+    家庭住址: employeeData.address || '',
     公司名称: companyName,
     统一信用代码: (companyData.code || '').trim(),
     /** 与爱签/工商常用表述一致，便于 dataKey 用「统一社会信用代码」的模板 */
@@ -89,6 +125,7 @@ export function buildAsignFillDataForContract(
     联系人: (companyData.contact_person || '').trim(),
     联系电话: (companyData.contact_phone || '').trim(),
     法定代表人: (companyData.legal_representative || '').trim(),
+    发薪日: String(paydayDate),
     日期: currentDateIso,
     日期文本: currentDateCn,
     当前日期: currentDateIso,
@@ -98,6 +135,10 @@ export function buildAsignFillDataForContract(
     生效日期: currentDateIso,
     签约日期: currentDateIso,
     文书日期: currentDateIso,
+    入职年份: hireDateYear,
+    入职月份: hireDateMonth,
+    入职日: hireDateDay,
+    入职日期文本: hireDateCn,
   };
 
   const out: Record<string, string> = {};

@@ -158,7 +158,7 @@ export default function TemplatesPage() {
   };
 
   const onlineGenerate = async () => {
-    const templateIdent = editingTemplate?.asign_template_ident?.trim() || '';
+    const templateIdent = formData.asign_template_ident.trim();
     const redirectUrl = window.location.href;
     const result = await openAsignTemplateDesigner({
       template_ident: templateIdent || undefined,
@@ -611,6 +611,7 @@ export default function TemplatesPage() {
                     <Input
                       id="asign_template_ident"
                       value={formData.asign_template_ident}
+                      readOnly
                       onChange={(e) =>
                         setFormData({
                           ...formData,
@@ -619,15 +620,21 @@ export default function TemplatesPage() {
                       }
                       placeholder="例如 TNB...；制作完成回跳后会自动回填"
                     />
-                    <p className="text-xs text-muted-foreground">
+                    {/* <p className="text-xs text-muted-foreground">
                       填写编号后可点击「查询控件/key」，调用爱签{' '}
                       <code className="rounded bg-muted px-1">template/getTemplateData</code>
                       ，对照返回中的 dataKey / 签署位 key 配置模板。
-                    </p>
+                    </p> */}
                     <div className="flex flex-wrap gap-2">
                       <Button type="button" variant="secondary" onClick={() => onlineGenerate()}>
-                        <Plus className="mr-2 h-4 w-4" />
-                        制作模板
+                        {formData.asign_template_ident.trim() && editingTemplate ? (
+                          '编辑模板'
+                        ) : (
+                          <>
+                            <Plus className="mr-2 h-4 w-4" />
+                            制作模板
+                          </>
+                        )}
                       </Button>
                       {/* <Button
                         type="button"
@@ -649,7 +656,7 @@ export default function TemplatesPage() {
                       </Button> */}
                     </div>
                   </div>
-                  <div className="space-y-2">
+                  {/* <div className="space-y-2">
                     <Label htmlFor="file">模板附件</Label>
                     <Input
                       id="file"
@@ -660,7 +667,7 @@ export default function TemplatesPage() {
                     {uploadedFile ? (
                       <p className="text-xs text-muted-foreground">已选择：{uploadedFile.name}</p>
                     ) : null}
-                  </div>
+                  </div> */}
                   <div className="flex items-center space-x-2">
                     <Checkbox
                       id="requires_company_signature"

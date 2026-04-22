@@ -440,6 +440,13 @@ verify_jwt = true
 import_map = "./functions/get-asign-template-data/deno.json"
 entrypoint = "./functions/get-asign-template-data/index.ts"
 
+# 爱签：按模板编号查询模板列表并返回预览地址（template/list）
+[functions.get-asign-template-list]
+enabled = true
+verify_jwt = true
+import_map = "./functions/get-asign-template-list/deno.json"
+entrypoint = "./functions/get-asign-template-list/index.ts"
+
 # 管理员创建用户（service_role + auth.admin.createUser，避免前端 signUp 抢占会话）
 [functions.admin-create-user]
 enabled = true

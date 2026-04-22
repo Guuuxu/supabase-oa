@@ -1112,6 +1112,17 @@ export type GetAsignTemplateDataResult =
   | { ok: true; data: unknown; template_ident: string }
   | { ok: false; error: string; detail?: unknown; debug?: unknown };
 
+export type GetAsignTemplateListResult =
+  | {
+      ok: true;
+      template_ident: string;
+      preview_url?: string;
+      sync_preview_url?: string;
+      row?: Record<string, unknown>;
+      data: unknown;
+    }
+  | { ok: false; error: string; detail?: unknown; debug?: unknown };
+
 /** Edge get-asign-template-data：爱签 template/getTemplateData，用于配置前查看控件 key */
 export async function getAsignTemplateData(params: {
   template_ident: string;
@@ -1141,6 +1152,53 @@ export async function getAsignTemplateData(params: {
     ok: true,
     data: payload.data,
     template_ident: typeof payload.template_ident === 'string' ? payload.template_ident : template_ident,
+  };
+}
+
+/** Edge get-asign-template-list：爱签 template/list，按模板编号查询并返回模板预览地址 */
+export async function getAsignTemplateList(params: {
+  template_ident: string;
+  page?: number;
+  rows?: number;
+}): Promise<GetAsignTemplateListResult> {
+  const template_ident = (params.template_ident ?? '').trim();
+  if (!template_ident) {
+    return { ok: false, error: '缺少爱签模板编号' };
+  }
+  const page = Number(params.page) > 0 ? Number(params.page) : 1;
+  const rows = Number(params.rows) > 0 ? Number(params.rows) : 10;
+  const { data, error } = await supabase.functions.invoke('get-asign-template-list', {
+    body: {
+      template_ident,
+      page,
+      rows,
+    },
+  });
+  if (error) {
+    return { ok: false, error: error.message };
+  }
+  const payload = data as Record<string, unknown> | null;
+  if (!payload || payload.ok !== true) {
+    const errMsg = payload && typeof payload.error === 'string' ? payload.error : '查询爱签模板列表失败';
+    return {
+      ok: false,
+      error: errMsg,
+      detail: payload?.detail,
+      debug: payload?.debug,
+    };
+  }
+  return {
+    ok: true,
+    template_ident:
+      typeof payload.template_ident === 'string' ? payload.template_ident : template_ident,
+    preview_url: typeof payload.preview_url === 'string' ? payload.preview_url : undefined,
+    sync_preview_url:
+      typeof payload.sync_preview_url === 'string' ? payload.sync_preview_url : undefined,
+    row:
+      payload.row && typeof payload.row === 'object' && !Array.isArray(payload.row)
+        ? (payload.row as Record<string, unknown>)
+        : undefined,
+    data: payload.data,
   };
 }
 

@@ -65,7 +65,7 @@ import {
   updateSigningRecordFile,
   downloadAsignContractAndSyncArchive,
   addAsignSignatory,
-  getAsignTemplateData,
+  getAsignTemplateList,
   type AsignAddSignerItem,
   type AsignSignStrategyItem,
 } from '@/db/api';
@@ -80,11 +80,6 @@ import { supabase } from '@/db/supabase';
 import { htmlStringToPdfBlob } from '@/utils/htmlToPdf';
 import { buildAsignFillDataForContract } from '@/utils/asignFillData';
 import {
-  enrichFillDataWithTemplateDateKeys,
-  filterAsignFillDataByTemplateDataKeys,
-} from '@/utils/asignTemplateFillFilter';
-import {
-  extractAsignTemplateControlHints,
   mergeTemplateDateSignKeysForAddSigner,
   pickAsignPartyBMainSignKey,
   type AsignTemplateControlHints,
@@ -164,6 +159,44 @@ export default function SigningsPage() {
     legal_representative: ''
   });
 
+  /** 电子签：第一步 createContract 的返回，第二步「立即发起」只做 addSigner + 落库 */
+  type InvokeCreateSigningReturn = {
+    contractNo: string;
+    effectiveContractNo: string;
+    contractName: string;
+    asign: unknown;
+    asignTemplateHints?: AsignTemplateControlHints;
+  };
+  type PendingElectronicSigningDraft =
+    | { kind: 'single'; result: InvokeCreateSigningReturn }
+    | {
+        kind: 'batch';
+        items: Array<{
+          docTemplate: DocumentTemplate;
+          fillEmployee: EmployeeFormData;
+          result: InvokeCreateSigningReturn;
+        }>;
+      };
+  const [pendingElectronicSigningDraft, setPendingElectronicSigningDraft] =
+    useState<PendingElectronicSigningDraft | null>(null);
+  const [isCreatingContractForPreview, setIsCreatingContractForPreview] = useState(false);
+  const [batchPreviewItems, setBatchPreviewItems] = useState<
+    Array<{ key: string; label: string; previewUrl: string }>
+  >([]);
+  /** 批量预览时按「项」切换；避免多条 previewUrl 相同导致 iframe 不刷新、按钮高亮错乱 */
+  const [selectedBatchPreviewKey, setSelectedBatchPreviewKey] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (batchPreviewItems.length <= 1) {
+      setSelectedBatchPreviewKey(null);
+      return;
+    }
+    setSelectedBatchPreviewKey((prev) =>
+      prev != null && batchPreviewItems.some((x) => x.key === prev)
+        ? prev
+        : batchPreviewItems[0].key,
+    );
+  }, [batchPreviewItems]);
 
   useEffect(() => {
     loadData();
@@ -335,7 +368,17 @@ export default function SigningsPage() {
       URL.revokeObjectURL(previewFileUrl);
     }
     setPreviewFileUrl('');
+    setPendingElectronicSigningDraft(null);
+    setBatchPreviewItems([]);
     setDialogOpen(true);
+  };
+
+  const handleSigningDialogOpenChange = (open: boolean) => {
+    setDialogOpen(open);
+    if (!open) {
+      setPendingElectronicSigningDraft(null);
+      setBatchPreviewItems([]);
+    }
   };
 
   // 生成文书模板内容
@@ -2295,120 +2338,157 @@ export default function SigningsPage() {
     
     // 保存到state供后续使用
     setFinalCompanyFormData(tempFinalCompanyFormData);
+    const companySnapshot = tempFinalCompanyFormData;
 
-    // 获取选中的文书模板名称列表
-    const selectedTemplateNames = selectedTemplates.map(t => t.name);
+    const selectedTemplatesWithAsign = selectedTemplates.filter((t) =>
+      Boolean((t.asign_template_ident || '').trim()),
+    );
+    if (selectedTemplatesWithAsign.length !== selectedTemplates.length) {
+      toast.error('当前所选文书存在未配置爱签模板编号的项，无法使用爱签模板预览。');
+      return;
+    }
 
-    // 为每个员工生成独立的文书集合
-    const allEmployeesDocuments = employeesFormData.map((employeeData, empIndex) => {
-      // 生成该员工的所有文书HTML内容
-      const documentsHtml = selectedTemplateNames.map((templateName, index) => {
-        const templateContent = generateTemplateContent(templateName);
-        const filledContent = replacePlaceholders(templateContent, employeeData, tempFinalCompanyFormData);
-        
-        // 为每个文书添加分页符（除了最后一个）
-        const pageBreak = index < selectedTemplateNames.length - 1 
-          ? '<div style="page-break-after: always;"></div>' 
-          : '';
-        
-        return filledContent + pageBreak;
-      }).join('\n');
+    const firstTemplate = selectedTemplatesWithAsign[0];
+    const templateIdent = String(firstTemplate.asign_template_ident || '').trim();
 
-      // 如果是员工单方签署，生成签署确认书
-      let confirmationLetterHtml = '';
-      if (!requiresCompanySignature) {
-        confirmationLetterHtml = generateConfirmationLetter(selectedTemplateNames, employeeData, tempFinalCompanyFormData);
-        // 在确认书前添加分页符
-        confirmationLetterHtml = '<div style="page-break-after: always;"></div>\n' + confirmationLetterHtml;
+    /** 仅使用 create-signing / createContract 返回体中的预览地址（如 previewUrl），不再请求模板列表或 getTemplateData */
+    const resolvePreviewUrlFromCreateResponse = (
+      asignRoot: unknown,
+      expectedContractNo?: string,
+    ): string => {
+      const url = extractAsignCreateContractPreviewUrl(asignRoot, expectedContractNo);
+      if (url) {
+        return url;
       }
+      throw new Error('创建签署文件未返回预览地址（previewUrl），请稍后重试或联系管理员。');
+    };
 
-      // 如果有多个文书，添加目录页
-      const tocHtml = selectedTemplateNames.length > 1 ? `
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>文书目录</title>
-  <style>
-    body { font-family: "SimSun", "宋体", serif; max-width: 800px; margin: 0 auto; padding: 40px 20px; background: #fff; }
-    h1 { text-align: center; font-size: 28px; margin-bottom: 50px; font-weight: bold; }
-    .toc { list-style: none; padding: 0; }
-    .toc li { padding: 15px; margin: 10px 0; border-left: 4px solid #1890ff; background: #f5f5f5; font-size: 18px; }
-    .info { margin: 30px 0; padding: 20px; background: #f9f9f9; border-radius: 4px; }
-    .info p { margin: 8px 0; }
-  </style>
-</head>
-<body>
-  <h1>签署文书目录</h1>
-  <div class="info">
-    <p><strong>员工：</strong>${employeeData.name}</p>
-    ${requiresCompanySignature ? `<p><strong>公司：</strong>${tempFinalCompanyFormData.name}</p>` : ''}
-    <p><strong>生成时间：</strong>${new Date().toLocaleString('zh-CN')}</p>
-  </div>
-  <ul class="toc">
-    ${selectedTemplateNames.map((name, i) => `<li>${i + 1}. ${name}</li>`).join('\n    ')}
-  </ul>
-</body>
-</html>
-<div style="page-break-after: always;"></div>
-` : '';
+    setOriginalContent('');
+    setEditableContent('');
+    setIsEditMode(false);
+    setPreviewFileType('pdf');
 
-      // 组合完整的HTML内容（文书正文 + 签署确认书）
-      const htmlContent = tocHtml + documentsHtml + confirmationLetterHtml;
+    if (formData.signing_mode === 'electronic') {
+      setIsCreatingContractForPreview(true);
+      try {
+        const needsCompanySigner = selectedTemplatesWithAsign.some(
+          (t) => t.requires_company_signature,
+        );
+        const hasAsignIdentForBatch = (t: DocumentTemplate) =>
+          Boolean((t.asign_template_ident || '').trim());
+        const allAsignTemplateModeForBatch =
+          selectedTemplatesWithAsign.length > 0 &&
+          selectedTemplatesWithAsign.every(hasAsignIdentForBatch);
 
-      // 如果有多个员工，在每个员工的文书集合前添加分隔页
-      const separatorPage = empIndex > 0 ? `
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <style>
-    body { font-family: "SimSun", "宋体", serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #f5f5f5; }
-    .separator { text-align: center; padding: 60px; background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-    h1 { font-size: 32px; color: #1890ff; margin-bottom: 20px; }
-    p { font-size: 18px; color: #666; margin: 10px 0; }
-  </style>
-</head>
-<body>
-  <div class="separator">
-    <h1>员工文书分隔页</h1>
-    <p><strong>员工姓名：</strong>${employeeData.name}</p>
-    <p><strong>身份证号：</strong>${employeeData.id_card}</p>
-    <p><strong>文书数量：</strong>${selectedTemplateNames.length} 份</p>
-  </div>
-</body>
-</html>
-<div style="page-break-after: always;"></div>
-` : '';
+        let previewUrl: string;
 
-      return {
-        employeeId: employeeData.id,
-        employeeName: employeeData.name,
-        content: separatorPage  + htmlContent
-      };
+        const shouldSplitByEmployee =
+          allAsignTemplateModeForBatch &&
+          (employeesFormData.length > 1 || selectedTemplatesWithAsign.length > 1);
+
+        if (shouldSplitByEmployee) {
+          const batchItems: Array<{
+            docTemplate: DocumentTemplate;
+            fillEmployee: EmployeeFormData;
+            result: InvokeCreateSigningReturn;
+          }> = [];
+          let batchIndex = 0;
+          const totalRounds =
+            selectedTemplatesWithAsign.length * employeesFormData.length;
+          for (const docTemplate of selectedTemplatesWithAsign) {
+            for (const emp of employeesFormData) {
+              batchIndex += 1;
+              toast.info(`正在创建爱签合同（${batchIndex}/${totalRounds}）…`);
+              const strangersOne = buildAsignStrangersForCreateSigning(
+                [emp],
+                needsCompanySigner ? companySnapshot : undefined,
+              );
+              const result = await invokeCreateSigning({
+                strangers: strangersOne,
+                companyFormSnapshot: companySnapshot,
+                asignRound: {
+                  docTemplate,
+                  fillEmployee: emp,
+                  contractNoNonce: `b${batchIndex}`,
+                },
+                suppressTemplateCreateToast: true,
+              });
+              batchItems.push({
+                docTemplate,
+                fillEmployee: emp,
+                result,
+              });
+            }
+          }
+          const previewItems: Array<{ key: string; label: string; previewUrl: string }> = [];
+          let previewIndex = 0;
+          for (const item of batchItems) {
+            previewIndex += 1;
+            const previewUrlForItem = resolvePreviewUrlFromCreateResponse(
+              item.result.asign,
+              item.result.effectiveContractNo,
+            );
+            previewItems.push({
+              key: `${item.docTemplate.id}_${item.fillEmployee.id}_${previewIndex}`,
+              label: `${previewIndex}. ${item.fillEmployee.name || item.fillEmployee.id} - ${item.docTemplate.name || '文书'}`,
+              previewUrl: previewUrlForItem,
+            });
+          }
+          setBatchPreviewItems(previewItems);
+          setPendingElectronicSigningDraft({ kind: 'batch', items: batchItems });
+          previewUrl = previewItems[0]?.previewUrl || '';
+          if (!previewUrl) {
+            throw new Error('批量合同预览地址为空，请稍后重试');
+          }
+        } else {
+          const strangers = buildAsignStrangersForCreateSigning(
+            employeesFormData,
+            needsCompanySigner ? companySnapshot : undefined,
+          );
+          const result = await invokeCreateSigning({
+            strangers,
+            companyFormSnapshot: companySnapshot,
+          });
+          setBatchPreviewItems([]);
+          setPendingElectronicSigningDraft({ kind: 'single', result });
+          previewUrl = resolvePreviewUrlFromCreateResponse(
+            result.asign,
+            result.effectiveContractNo,
+          );
+        }
+
+        setPreviewFileUrl(previewUrl);
+        toast.success(
+          '已创建待签署文件，请预览确认后点击「立即发起」以添加签署方并完成发起。',
+        );
+      } catch (err) {
+        setPendingElectronicSigningDraft(null);
+        setBatchPreviewItems([]);
+        setPreviewFileUrl('');
+        const msg = err instanceof Error ? err.message : String(err);
+        toast.error('创建待签署文件失败', { description: msg, duration: 6000 });
+      } finally {
+        setIsCreatingContractForPreview(false);
+      }
+      return;
+    }
+
+    setPendingElectronicSigningDraft(null);
+    setBatchPreviewItems([]);
+    const listResOnly = await getAsignTemplateList({
+      template_ident: templateIdent,
+      page: 1,
+      rows: 10,
     });
-
-    // 合并所有员工的文书
-    const combinedHtmlContent = allEmployeesDocuments.map(doc => doc.content).join('\n');
-
-    // 保存原始内容和可编辑内容
-    setOriginalContent(combinedHtmlContent);
-    setEditableContent(combinedHtmlContent);
-    setIsEditMode(false); // 默认非编辑模式
-
-    // 创建Blob并生成URL
-    const blob = new Blob([combinedHtmlContent], { type: 'text/html;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-
-    // 设置预览URL，在信息确认对话框中显示
-    setPreviewFileUrl(url);
-    setPreviewFileType('pdf'); // HTML也用iframe显示
-
-    // 提示用户
-    toast.success(`已为 ${employeesFormData.length} 名员工生成文书，正在预览`);
-    
-    // 不在这里创建签署记录，而是在用户点击"立即发起"按钮时创建
+    if (!listResOnly.ok) {
+      throw new Error(listResOnly.error || '获取爱签模板预览地址失败');
+    }
+    const templatePreviewUrlOnly = listResOnly.preview_url || listResOnly.sync_preview_url;
+    if (!templatePreviewUrlOnly) {
+      throw new Error('爱签模板预览地址为空，请稍后重试');
+    }
+    setPreviewFileUrl(templatePreviewUrlOnly);
+    toast.success('已切换为爱签模板预览，请确认后继续发起签署。');
   };
 
   const blobToBase64 = async (blob: Blob) => {
@@ -2463,6 +2543,131 @@ export default function SigningsPage() {
     };
 
     return tryNode(asignRoot, 0) ?? 1;
+  };
+
+  /** 从 createContract 返回中尽量解析待签署文件预览地址（优先合同级 URL） */
+  const extractAsignCreateContractPreviewUrl = (
+    asignRoot: unknown,
+    expectedContractNo?: string,
+  ): string | undefined => {
+    const pickHttp = (v: unknown): string | undefined => {
+      if (typeof v !== 'string') return undefined;
+      const s = v.trim();
+      if (!s) return undefined;
+      return /^https?:\/\//i.test(s) ? s : undefined;
+    };
+
+    /** 优先使用接口明确返回的 previewUrl（create-signing 包装在 asign / asign.data 下） */
+    const tryShallowPreviewUrl = (node: unknown): string | undefined => {
+      if (!node || typeof node !== 'object') {
+        return undefined;
+      }
+      const read = (r: Record<string, unknown>): string | undefined => {
+        for (const k of ['previewUrl', 'preview_url']) {
+          const u = pickHttp(r[k]);
+          if (u) {
+            return u;
+          }
+        }
+        return undefined;
+      };
+      const root = node as Record<string, unknown>;
+      const fromRoot = read(root);
+      if (fromRoot) {
+        return fromRoot;
+      }
+      const nestedAsign = root.asign;
+      if (nestedAsign && typeof nestedAsign === 'object') {
+        const a = nestedAsign as Record<string, unknown>;
+        const fromAsign = read(a);
+        if (fromAsign) {
+          return fromAsign;
+        }
+        const ad = a.data;
+        if (ad && typeof ad === 'object') {
+          return read(ad as Record<string, unknown>);
+        }
+      }
+      return undefined;
+    };
+
+    const directPreview = tryShallowPreviewUrl(asignRoot);
+    if (directPreview) {
+      return directPreview;
+    }
+
+    const expected = (expectedContractNo || '').trim().toLowerCase();
+    const scoredCandidates: Array<{ url: string; score: number; path: string }> = [];
+
+    const scoreUrl = (url: string, keyPath: string): number => {
+      const u = url.toLowerCase();
+      const k = keyPath.toLowerCase();
+      let score = 0;
+      if (u.includes('preview') || u.includes('view') || u.includes('sync')) score += 4;
+      if (k.includes('contractfiles')) score += 4;
+      if (k.includes('syncurl') || k.includes('preview') || k.includes('viewurl') || k.includes('url')) {
+        score += 2;
+      }
+      if (expected && (u.includes(expected) || k.includes(expected))) score += 8;
+      return score;
+    };
+
+    const pushCandidate = (raw: unknown, keyPath: string) => {
+      const hit = pickHttp(raw);
+      if (!hit) return;
+      scoredCandidates.push({ url: hit, score: scoreUrl(hit, keyPath), path: keyPath });
+    };
+
+    const walk = (node: unknown, depth: number, path: string) => {
+      if (depth > 12 || node === null || node === undefined) return;
+      if (typeof node === 'string') {
+        pushCandidate(node, path);
+        return;
+      }
+      if (Array.isArray(node)) {
+        for (let i = 0; i < node.length; i += 1) {
+          walk(node[i], depth + 1, `${path}[${i}]`);
+        }
+        return;
+      }
+      if (typeof node !== 'object') return;
+      const o = node as Record<string, unknown>;
+      const focusedKeys = [
+        'syncUrl',
+        'sync_url',
+        'previewUrl',
+        'preview_url',
+        'viewUrl',
+        'view_url',
+        'url',
+      ];
+      for (const k of focusedKeys) {
+        pushCandidate(o[k], `${path}.${k}`);
+      }
+      for (const [k, v] of Object.entries(o)) {
+        walk(v, depth + 1, `${path}.${k}`);
+      }
+    };
+
+    walk(asignRoot, 0, 'root');
+    if (scoredCandidates.length === 0) return undefined;
+    const previewPathCandidates = scoredCandidates.filter((c) => {
+      const p = c.path.toLowerCase();
+      return p.includes('previewurl') || p.includes('preview_url');
+    });
+    if (previewPathCandidates.length > 0) {
+      previewPathCandidates.sort((a, b) => b.score - a.score);
+      return previewPathCandidates[0].url;
+    }
+    const syncCandidates = scoredCandidates.filter(
+      (c) => c.path.toLowerCase().includes('syncurl') || c.path.toLowerCase().includes('sync_url'),
+    );
+    if (syncCandidates.length > 0) {
+      syncCandidates.sort((a, b) => b.score - a.score);
+      return syncCandidates[0].url;
+    }
+    scoredCandidates.sort((a, b) => b.score - a.score);
+    return scoredCandidates[0].url;
   };
 
   /**
@@ -2552,6 +2757,7 @@ export default function SigningsPage() {
     const hints = options?.asignTemplateHints;
     let strategyPartyA: AsignSignStrategyItem[];
     let strategyPartyB: AsignSignStrategyItem[];
+    let employeePrimarySignKeyPool: string[] = [];
 
     if (hints) {
       const signKeySet = new Set(hints.signKeys.map((s) => s.trim()).filter(Boolean));
@@ -2601,6 +2807,17 @@ export default function SigningsPage() {
           signKey: key,
         })),
       ];
+      const personalKeyPattern = /个人|乙方|员工|受雇方|劳动者|签字人/i;
+      const excludeSet = new Set<string>(['甲方', ...dateKeysOrdered, ...extrasFiltered]);
+      employeePrimarySignKeyPool = hints.signKeys
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .filter((k) => !excludeSet.has(k))
+        .filter((k) => personalKeyPattern.test(k));
+      if (!employeePrimarySignKeyPool.includes(mainB)) {
+        employeePrimarySignKeyPool.unshift(mainB);
+      }
+      employeePrimarySignKeyPool = Array.from(new Set(employeePrimarySignKeyPool));
     } else {
       /** 甲方：非爱签模板路径（如 HTML 转 PDF）仍沿用固定关键字 */
       strategyPartyA = [
@@ -2653,7 +2870,16 @@ export default function SigningsPage() {
       ];
     }
 
+    const validEmployeeRows = employeeRows.filter((emp) => (emp.phone || '').trim().replace(/\s/g, ''));
+    const isMultiEmployeeWithTemplateHints = Boolean(hints) && validEmployeeRows.length > 1;
+    if (isMultiEmployeeWithTemplateHints && employeePrimarySignKeyPool.length < validEmployeeRows.length) {
+      throw new Error(
+        `所选模板可用的个人签署位不足：需要 ${validEmployeeRows.length} 个，实际仅 ${employeePrimarySignKeyPool.length} 个。请在爱签模板中为每位员工配置独立签署位（例如：员工1、员工2...）。`,
+      );
+    }
+
     const employeeItems: AsignAddSignerItem[] = [];
+    let employeeIndex = 0;
     for (const emp of employeeRows) {
       const mobile = (emp.phone || '').trim().replace(/\s/g, '');
       if (!mobile) {
@@ -2664,6 +2890,21 @@ export default function SigningsPage() {
         throw new Error(`电子签署要求员工身份证号，用于生成 account（规则：ASIGN+身份证号）。缺失员工：${emp.name || emp.id}`);
       }
       const account = `ASIGN${idCard}`;
+      let employeeSignStrategyList: AsignSignStrategyItem[] = strategyPartyB.map((s) => ({ ...s }));
+      if (isMultiEmployeeWithTemplateHints) {
+        const employeeSignKey = employeePrimarySignKeyPool[employeeIndex];
+        if (!employeeSignKey) {
+          throw new Error('模板签署位分配失败：未找到员工对应 signKey，请检查模板签署位配置。');
+        }
+        employeeSignStrategyList = [
+          {
+            attachNo,
+            locationMode: 4,
+            signType: 1,
+            signKey: employeeSignKey,
+          },
+        ];
+      }
       employeeItems.push({
         account,
         signType: 3,
@@ -2671,8 +2912,9 @@ export default function SigningsPage() {
         noticeMobile: mobile,
         signOrder: '1',
         isNotice: 1,
-        signStrategyList: strategyPartyB.map((s) => ({ ...s })),
+        signStrategyList: employeeSignStrategyList,
       });
+      employeeIndex += 1;
     }
 
     const company = options?.appendCompany;
@@ -2810,6 +3052,8 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
       companyName?: string;
       creditCode?: string;
     }>;
+    /** 提交第一步时 state 尚未写入 finalCompanyFormData，须显式传入公司快照用于 fillData */
+    companyFormSnapshot?: typeof finalCompanyFormData;
     /**
      * 多份爱签模板时由调用方循环传入：每轮一单 createContract。
      * 单份模板多人签署一份合同时勿传，由下方逻辑用「首位员工」填充模板正文控件。
@@ -2820,6 +3064,8 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
       /** 拼进 contractNo，避免连发撞号 */
       contractNoNonce?: string;
     };
+    /** 外层已展示创建进度时，避免内部提示覆盖前一条 */
+    suppressTemplateCreateToast?: boolean;
   }) => {
     const selectedForAsign = templates.filter((t) => formData.template_ids.includes(t.id));
     const hasAsignIdent = (t: DocumentTemplate) => Boolean((t.asign_template_ident || '').trim());
@@ -2874,7 +3120,6 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
 
     let contractName: string;
     let invokeBody: Record<string, unknown>;
-    let asignTemplateHints: AsignTemplateControlHints | undefined;
 
     if (allAsignTemplateMode) {
       let docTemplate: DocumentTemplate | null = null;
@@ -2897,30 +3142,9 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
           '多份爱签文书须按份逐单创建，请使用发起流程中的分批逻辑；若仍看到本提示请联系管理员。',
         );
       }
-      const tid = String(docTemplate.asign_template_ident).trim();
-      const tdRes = await getAsignTemplateData({ template_ident: tid });
-      if (!tdRes.ok) {
-        throw new Error(tdRes.error || '获取爱签模板控件信息失败，请稍后重试或联系管理员。');
-      }
-      asignTemplateHints = extractAsignTemplateControlHints(tdRes.data);
-      if (asignTemplateHints.signKeys.length === 0) {
-        throw new Error(
-          '未能从爱签模板中解析出签署位（signKey）。请在文书模板管理页用「查询控件」核对模板，或联系管理员。',
-        );
-      }
-      const fillCore = buildAsignFillDataForContract(fillEmp, finalCompanyFormData);
-      let fillData =
-        asignTemplateHints.fillDataKeys.length > 0
-          ? filterAsignFillDataByTemplateDataKeys(fillCore, asignTemplateHints.fillDataKeys)
-          : fillCore;
-      if (asignTemplateHints.fillDataKeys.length > 0) {
-        fillData = enrichFillDataWithTemplateDateKeys(
-          fillCore,
-          asignTemplateHints.fillDataKeys,
-          asignTemplateHints.signKeys,
-          fillData,
-        );
-      }
+      const companyForFill = opts?.companyFormSnapshot ?? finalCompanyFormData;
+      const fillCore = buildAsignFillDataForContract(fillEmp, companyForFill);
+      const fillData = fillCore;
       const rawName = (docTemplate.name || '文书').trim();
       const fileName = rawName
         .replace(/\.(pdf|docx?|doc)$/i, '')
@@ -2941,7 +3165,9 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
           },
         ],
       };
-      toast.info('正在通过爱签模板创建待签署文件…');
+      if (!opts?.suppressTemplateCreateToast) {
+        toast.info('正在通过爱签模板创建待签署文件…');
+      }
     } else {
       if (!previewFileUrl) {
         throw new Error('缺少预览文件，无法发起签署');
@@ -2996,7 +3222,13 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
 
     const effectiveContractNo = extractContractNoFromCreateSigningResponse(data, contractNo);
 
-    return { contractNo, effectiveContractNo, contractName, asign: data, asignTemplateHints };
+    return {
+      contractNo,
+      effectiveContractNo,
+      contractName,
+      asign: data,
+      asignTemplateHints: undefined,
+    };
   };
 
   const handleViewDetail = (signing: SigningRecord) => {
@@ -3346,7 +3578,7 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
             <h1 className="text-3xl font-bold">文书签署管理</h1>
             <p className="text-muted-foreground mt-2">发起和管理文书签署流程</p>
           </div>
-          <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+          <Dialog open={dialogOpen} onOpenChange={handleSigningDialogOpenChange}>
             <DialogTrigger asChild>
               <Button onClick={handleOpenDialog}>
                 <Plus className="mr-2 h-4 w-4" />
@@ -4013,6 +4245,30 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                 {previewFileUrl && (
                   <div className="border-t pt-4 mt-4">
                     <h3 className="text-lg font-semibold mb-4">文书预览</h3>
+                    {batchPreviewItems.length > 1 && (
+                      <div className="mb-3 flex flex-wrap gap-2">
+                        {batchPreviewItems.map((item) => {
+                          const activeKey =
+                            selectedBatchPreviewKey ?? batchPreviewItems[0]?.key ?? '';
+                          const isActive = item.key === activeKey;
+                          return (
+                          <Button
+                            key={item.key}
+                            type="button"
+                            size="sm"
+                            variant={isActive ? 'default' : 'outline'}
+                            onClick={() => {
+                              setSelectedBatchPreviewKey(item.key);
+                              setPreviewFileUrl(item.previewUrl);
+                              setIsEditMode(false);
+                            }}
+                          >
+                            {item.label}
+                          </Button>
+                          );
+                        })}
+                      </div>
+                    )}
                     <div className="border rounded-lg overflow-hidden" style={{ height: '600px' }}>
                       {isEditMode ? (
                         <div
@@ -4029,49 +4285,58 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                         />
                       ) : (
                         <iframe
+                          key={
+                            batchPreviewItems.length > 1
+                              ? `${selectedBatchPreviewKey ?? batchPreviewItems[0]?.key ?? 'batch'}:${previewFileUrl}`
+                              : previewFileUrl
+                          }
                           src={previewFileUrl}
                           className="w-full h-full"
                           title="文书预览"
                         />
                       )}
                     </div>
-                    <div className="flex gap-2 mt-4">
-                      <Button
-                        type="button"
-                        variant="outline"
-                        onClick={() => {
-                          if (isEditMode) {
-                            // 保存编辑
-                            setOriginalContent(editableContent);
-                            setIsEditMode(false);
-                            toast.success('编辑已保存');
-                          } else {
-                            // 进入编辑模式
-                            setIsEditMode(true);
-                          }
-                        }}
-                      >
-                        {isEditMode ? '保存编辑' : '编辑'}
-                      </Button>
-                      <Button
-                        type="button"
-                        variant="outline"
-                        onClick={() => {
-                          const link = document.createElement('a');
-                          link.href = previewFileUrl;
-                          link.download = `文书_${new Date().getTime()}.html`;
-                          link.click();
-                        }}
-                      >
-                        下载文件
-                      </Button>
-                    </div>
+                    {previewFileUrl.startsWith('blob:') && (
+                      <div className="flex gap-2 mt-4">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          onClick={() => {
+                            if (isEditMode) {
+                              // 保存编辑
+                              setOriginalContent(editableContent);
+                              setIsEditMode(false);
+                              toast.success('编辑已保存');
+                            } else {
+                              // 进入编辑模式
+                              setIsEditMode(true);
+                            }
+                          }}
+                        >
+                          {isEditMode ? '保存编辑' : '编辑'}
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          onClick={() => {
+                            const link = document.createElement('a');
+                            link.href = previewFileUrl;
+                            link.download = `文书_${new Date().getTime()}.html`;
+                            link.click();
+                          }}
+                        >
+                          下载文件
+                        </Button>
+                      </div>
+                    )}
                   </div>
                 )}
                 
                 <DialogFooter>
                   <Button type="button" variant="outline" onClick={() => {
                     setDialogOpen(false);
+                    setPendingElectronicSigningDraft(null);
+                    setBatchPreviewItems([]);
                     // 清理预览URL
                     if (previewFileUrl && previewFileUrl.startsWith('blob:')) {
                       URL.revokeObjectURL(previewFileUrl);
@@ -4081,8 +4346,8 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                     取消
                   </Button>
                   {!previewFileUrl ? (
-                    <Button type="submit">
-                      发起签署
+                    <Button type="submit" disabled={isCreatingContractForPreview}>
+                      {isCreatingContractForPreview ? '正在创建…' : '发起签署'}
                     </Button>
                   ) : (
                     <Button type="button" onClick={async () => {
@@ -4132,11 +4397,132 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                             selectedTemplatesForAsign.length > 0 &&
                             selectedTemplatesForAsign.every(hasAsignIdentForBatch);
 
-                          /** 多份爱签模板：每人每份文书一单合同（一人多合同、多人多份每人一套） */
-                          if (
+                          const readThirdPartySigningId = (asignRoot: unknown): string | undefined => {
+                            const asignRoundData: any = asignRoot;
+                            return (
+                              asignRoundData?.contractId ??
+                              asignRoundData?.contract_id ??
+                              asignRoundData?.data?.contractId ??
+                              asignRoundData?.data?.contract_id ??
+                              asignRoundData?.asign?.contractId ??
+                              asignRoundData?.asign?.contract_id ??
+                              undefined
+                            );
+                          };
+
+                          /** 已在「发起签署」步骤创建合同：此处仅 addSigner + 每人落库 */
+                          if (pendingElectronicSigningDraft?.kind === 'batch') {
+                            const totalRounds = pendingElectronicSigningDraft.items.length;
+                            let done = 0;
+                            for (const item of pendingElectronicSigningDraft.items) {
+                              done += 1;
+                              toast.info(`正在添加签署方（${done}/${totalRounds}）…`);
+                              const { result, docTemplate, fillEmployee: emp } = item;
+                              const contractNoForRound = result.effectiveContractNo;
+                              const thirdPartySigningIdRound = readThirdPartySigningId(result.asign);
+                              const contractAttachNoRound =
+                                getAsignCreateContractAttachNo(result.asign);
+                              const signersRound = buildAsignAddSignerItemsForEmployees(
+                                [emp],
+                                {
+                                  appendCompany: needsCompanySigner
+                                    ? finalCompanyFormData
+                                    : undefined,
+                                  contractAttachNo: contractAttachNoRound,
+                                  asignTemplateHints: result.asignTemplateHints,
+                                },
+                              );
+                              if (signersRound.length === 0) {
+                                throw new Error(
+                                  '无法添加签署方：请确认员工手机号与企业联系电话已填写（noticeMobile）',
+                                );
+                              }
+                              const addSignResRound = await addAsignSignatory({
+                                contractNo: contractNoForRound,
+                                signers: signersRound,
+                              });
+                              if (!addSignResRound.success) {
+                                throw new Error(
+                                  addSignResRound.error || '添加签署方失败',
+                                );
+                              }
+                              const rec = await createSigningRecord({
+                                company_id: formData.company_id,
+                                employee_id: emp.id,
+                                template_ids: [docTemplate.id],
+                                status: 'pending' as SigningStatus,
+                                signing_mode: formData.signing_mode,
+                                third_party_contract_no: contractNoForRound,
+                                third_party_contract_name: result.contractName,
+                                third_party_signing_id: thirdPartySigningIdRound,
+                                notes: formData.notes?.trim() ? formData.notes : undefined,
+                                created_by: profile?.id,
+                                employee_form_data: emp,
+                                company_form_data: finalCompanyFormData,
+                              });
+                              if (!rec) {
+                                throw new Error(
+                                  `签署记录创建失败（文书：${docTemplate.name || docTemplate.id}，员工：${emp.name || emp.id}）。`,
+                                );
+                              }
+                            }
+                            toast.success(
+                              `签署发起成功！已创建 ${totalRounds} 笔爱签合同（${selectedTemplatesForAsign.length} 份文书 × ${employeesFormData.length} 名员工）。`,
+                              {
+                                description:
+                                  '每位员工每份文书对应独立合同号；请留意短信签署链接。',
+                                duration: 6000,
+                              },
+                            );
+                            await loadData();
+                            setDialogOpen(false);
+                            setPendingElectronicSigningDraft(null);
+                            setBatchPreviewItems([]);
+                            if (previewFileUrl && previewFileUrl.startsWith('blob:')) {
+                              URL.revokeObjectURL(previewFileUrl);
+                              setPreviewFileUrl('');
+                            }
+                            return;
+                          }
+
+                          if (pendingElectronicSigningDraft?.kind === 'single') {
+                            if (employeesFormData.length > 1) {
+                              throw new Error(
+                                '多员工发起需为每位员工单独生成合同，请重新点击「发起签署」生成批量待签署文件。',
+                              );
+                            }
+                            const result = pendingElectronicSigningDraft.result;
+                            thirdPartyContractNo = result.effectiveContractNo;
+                            thirdPartyContractName = result.contractName;
+                            thirdPartySigningId = readThirdPartySigningId(result.asign);
+                            const contractAttachNo = getAsignCreateContractAttachNo(result.asign);
+                            const signersFromDraft = buildAsignAddSignerItemsForEmployees(
+                              employeesFormData,
+                              {
+                                appendCompany: needsCompanySigner
+                                  ? finalCompanyFormData
+                                  : undefined,
+                                contractAttachNo,
+                                asignTemplateHints: result.asignTemplateHints,
+                              },
+                            );
+                            if (signersFromDraft.length === 0) {
+                              throw new Error(
+                                '无法添加签署方：请确认员工手机号与企业联系电话已填写（noticeMobile）',
+                              );
+                            }
+                            const addSignResDraft = await addAsignSignatory({
+                              contractNo: thirdPartyContractNo,
+                              signers: signersFromDraft,
+                            });
+                            if (!addSignResDraft.success) {
+                              throw new Error(addSignResDraft.error || '添加签署方失败');
+                            }
+                          } else if (
                             allAsignTemplateModeForBatch &&
-                            selectedTemplatesForAsign.length > 1
+                            (employeesFormData.length > 1 || selectedTemplatesForAsign.length > 1)
                           ) {
+                            /** 多份爱签模板：每人每份文书一单合同（未走两步预览时的兼容路径） */
                             let batchIndex = 0;
                             const totalRounds =
                               selectedTemplatesForAsign.length * employeesFormData.length;
@@ -4157,17 +4543,12 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                                     fillEmployee: emp,
                                     contractNoNonce: `b${batchIndex}`,
                                   },
+                                  suppressTemplateCreateToast: true,
                                 });
                                 const contractNoForRound = result.effectiveContractNo;
-                                const asignRoundData: any = result.asign;
-                                const thirdPartySigningIdRound =
-                                  asignRoundData?.contractId ??
-                                  asignRoundData?.contract_id ??
-                                  asignRoundData?.data?.contractId ??
-                                  asignRoundData?.data?.contract_id ??
-                                  asignRoundData?.asign?.contractId ??
-                                  asignRoundData?.asign?.contract_id ??
-                                  undefined;
+                                const thirdPartySigningIdRound = readThirdPartySigningId(
+                                  result.asign,
+                                );
                                 const contractAttachNoRound =
                                   getAsignCreateContractAttachNo(result.asign);
                                 const signersRound = buildAsignAddSignerItemsForEmployees(
@@ -4225,51 +4606,44 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                             );
                             await loadData();
                             setDialogOpen(false);
+                            setPendingElectronicSigningDraft(null);
+                            setBatchPreviewItems([]);
                             if (previewFileUrl && previewFileUrl.startsWith('blob:')) {
                               URL.revokeObjectURL(previewFileUrl);
                               setPreviewFileUrl('');
                             }
                             return;
-                          }
-
-                          const strangers = buildAsignStrangersForCreateSigning(
-                            employeesFormData,
-                            needsCompanySigner ? finalCompanyFormData : undefined,
-                          );
-                          const result = await invokeCreateSigning({ strangers });
-                          const contractNoForAsign = result.effectiveContractNo;
-                          thirdPartyContractNo = contractNoForAsign;
-                          thirdPartyContractName = result.contractName;
-                          // 兼容不同返回结构：优先找常见字段
-                          const asignData: any = result.asign;
-                          thirdPartySigningId =
-                            asignData?.contractId ??
-                            asignData?.contract_id ??
-                            asignData?.data?.contractId ??
-                            asignData?.data?.contract_id ??
-                            asignData?.asign?.contractId ??
-                            asignData?.asign?.contract_id ??
-                            undefined;
-
-                          const contractAttachNo = getAsignCreateContractAttachNo(result.asign);
-
-                          const signers = buildAsignAddSignerItemsForEmployees(employeesFormData, {
-                            appendCompany: needsCompanySigner ? finalCompanyFormData : undefined,
-                            contractAttachNo,
-                            asignTemplateHints: result.asignTemplateHints,
-                          });
-                          if (signers.length === 0) {
-                            throw new Error(
-                              '无法添加签署方：请确认员工手机号与企业联系电话已填写（noticeMobile）'
+                          } else {
+                            const strangers = buildAsignStrangersForCreateSigning(
+                              employeesFormData,
+                              needsCompanySigner ? finalCompanyFormData : undefined,
                             );
-                          }
-                          // signers 为数组：企业方 + 员工等须一次传齐；Edge 单次 addSigner，bizData 内为签署方数组（合同仅可调一次该接口）
-                          const addSignRes = await addAsignSignatory({
-                            contractNo: contractNoForAsign,
-                            signers,
-                          });
-                          if (!addSignRes.success) {
-                            throw new Error(addSignRes.error || '添加签署方失败');
+                            const result = await invokeCreateSigning({ strangers });
+                            const contractNoForAsign = result.effectiveContractNo;
+                            thirdPartyContractNo = contractNoForAsign;
+                            thirdPartyContractName = result.contractName;
+                            const asignData: any = result.asign;
+                            thirdPartySigningId = readThirdPartySigningId(asignData);
+
+                            const contractAttachNo = getAsignCreateContractAttachNo(result.asign);
+
+                            const signers = buildAsignAddSignerItemsForEmployees(employeesFormData, {
+                              appendCompany: needsCompanySigner ? finalCompanyFormData : undefined,
+                              contractAttachNo,
+                              asignTemplateHints: result.asignTemplateHints,
+                            });
+                            if (signers.length === 0) {
+                              throw new Error(
+                                '无法添加签署方：请确认员工手机号与企业联系电话已填写（noticeMobile）'
+                              );
+                            }
+                            const addSignRes = await addAsignSignatory({
+                              contractNo: contractNoForAsign,
+                              signers,
+                            });
+                            if (!addSignRes.success) {
+                              throw new Error(addSignRes.error || '添加签署方失败');
+                            }
                           }
                         }
 
@@ -4315,6 +4689,8 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                         
                         // 关闭对话框
                         setDialogOpen(false);
+                        setPendingElectronicSigningDraft(null);
+                        setBatchPreviewItems([]);
                         // 清理预览URL
                         if (previewFileUrl && previewFileUrl.startsWith('blob:')) {
                           URL.revokeObjectURL(previewFileUrl);
@@ -4624,9 +5000,9 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                   selectedSigning.third_party_contract_no && (
                     <div className="border-t pt-4 space-y-2">
                       <Label className="text-muted-foreground">爱签档案同步</Label>
-                      <p className="text-sm text-muted-foreground">
+                      {/* <p className="text-sm text-muted-foreground">
                         调用下载合同接口将 PDF 写入档案表与 Storage（不影响异步回调逻辑，可作补拉）。
-                      </p>
+                      </p> */}
                       <div className="flex flex-wrap gap-2 items-center">
                         <Button
                           type="button"
@@ -4638,7 +5014,7 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                           <CloudDownload className="h-4 w-4 mr-1" />
                           {syncingAsignPdf ? '同步中…' : '从爱签同步 PDF'}
                         </Button>
-                        <Button
+                        {/* <Button
                           type="button"
                           variant="outline"
                           size="sm"
@@ -4646,7 +5022,7 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                           onClick={() => handlePullAsignContractPdf(selectedSigning, 1)}
                         >
                           强制拉取
-                        </Button>
+                        </Button> */}
                         <span className="text-xs text-muted-foreground font-mono break-all">
                           {selectedSigning.third_party_contract_no}
                         </span>
