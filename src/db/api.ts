@@ -2842,14 +2842,19 @@ export async function updateSalaryRecord(id: string, updates: Partial<SalaryReco
 
 // 删除工资记录
 export async function deleteSalaryRecord(id: string): Promise<boolean> {
-  const { error } = await supabase
+  const { data, error } = await supabase
     .from('salary_records')
     .delete()
-    .eq('id', id);
+    .eq('id', id)
+    .select('id');
 
   if (error) {
     console.error('删除工资记录失败:', error);
     throw error;
+  }
+
+  if (!data || data.length === 0) {
+    throw new Error('未删除任何记录，请检查删除权限或记录是否存在');
   }
 
   return true;
