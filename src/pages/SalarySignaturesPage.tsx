@@ -232,6 +232,8 @@ export default function SalarySignaturesPage() {
   const [batchSendYearMonth, setBatchSendYearMonth] = useState<string>('');
   const [compensationTemplates, setCompensationTemplates] = useState<DocumentTemplate[]>([]);
   const [batchSendTemplateIds, setBatchSendTemplateIds] = useState<string[]>([]);
+  const [batchSendEmployees, setBatchSendEmployees] = useState<Employee[]>([]);
+  const [batchSendEmployeeIds, setBatchSendEmployeeIds] = useState<string[]>([]);
   const [isCreatingSalaryAsignPreview, setIsCreatingSalaryAsignPreview] = useState(false);
   const [batchSendProgress, setBatchSendProgress] = useState({ current: 0, total: 0 });
 
@@ -270,17 +272,24 @@ export default function SalarySignaturesPage() {
     if (!batchSendDialogOpen || !batchSendCompany) {
       setCompensationTemplates([]);
       setBatchSendTemplateIds([]);
+      setBatchSendEmployees([]);
+      setBatchSendEmployeeIds([]);
       return;
     }
     let cancelled = false;
     (async () => {
-      const all = await getDocumentTemplates(batchSendCompany);
+      const [all, employees] = await Promise.all([
+        getDocumentTemplates(batchSendCompany),
+        getEmployees(batchSendCompany),
+      ]);
       if (cancelled) {
         return;
       }
       const comp = all.filter((t) => t.category === 'compensation' && t.is_active);
       setCompensationTemplates(comp);
       setBatchSendTemplateIds([]);
+      setBatchSendEmployees(employees);
+      setBatchSendEmployeeIds([]);
     })();
     return () => {
       cancelled = true;
@@ -773,6 +782,8 @@ export default function SalarySignaturesPage() {
     setBatchSendCompany('');
     setCompensationTemplates([]);
     setBatchSendTemplateIds([]);
+    setBatchSendEmployees([]);
+    setBatchSendEmployeeIds([]);
     setBatchSendProgress({ current: 0, total: 0 });
     setSalaryLaunchDrafts([]);
     setBatchSendDialogOpen(true);
@@ -802,6 +813,25 @@ export default function SalarySignaturesPage() {
     });
   };
 
+  const handleBatchSendEmployeeToggle = (employeeId: string) => {
+    setBatchSendEmployeeIds((prev) => {
+      if (prev.includes(employeeId)) {
+        return prev.filter((id) => id !== employeeId);
+      }
+      return [...prev, employeeId];
+    });
+  };
+
+  const handleBatchSendEmployeeToggleAll = () => {
+    const allIds = batchSendEmployees.map((e) => e.id);
+    setBatchSendEmployeeIds((prev) => {
+      if (prev.length === allIds.length) {
+        return [];
+      }
+      return allIds;
+    });
+  };
+
   /** 第一步：通过 create-signing 生成爱签待签文件并预览（不落库签署记录） */
   const handleBatchSendConfirm = async () => {
     if (!batchSendCompany) {
@@ -816,6 +846,10 @@ export default function SalarySignaturesPage() {
 
     if (batchSendTemplateIds.length === 0) {
       toast.error('请至少选择一种待签署文件类型（文书模板）');
+      return;
+    }
+    if (batchSendEmployeeIds.length === 0) {
+      toast.error('请至少选择一名员工');
       return;
     }
 
@@ -877,8 +911,9 @@ export default function SalarySignaturesPage() {
       }
     }
 
-    const employees = await getEmployees(batchSendCompany);
+    const employees = batchSendEmployees;
     const empById = new Map(employees.map((e) => [e.id, e]));
+    const selectedEmployeeIdSet = new Set(batchSendEmployeeIds);
     const sourceUnits: Array<{
       employee_id: string;
       type: SalarySignatureType;
@@ -892,6 +927,9 @@ export default function SalarySignaturesPage() {
       for (const record of salaryRecords) {
         const items = await getSalaryItems(record.id);
         for (const item of items) {
+          if (!selectedEmployeeIdSet.has(item.employee_id)) {
+            continue;
+          }
           const key = `${item.employee_id}_salary_slip`;
           if (sourceKeySet.has(key)) {
             continue;
@@ -910,6 +948,9 @@ export default function SalarySignaturesPage() {
     if (allowedTypes.has('attendance_record')) {
       const attendanceRecords = await getAttendanceRecords(batchSendCompany, monthText);
       for (const attendance of attendanceRecords) {
+        if (!selectedEmployeeIdSet.has(attendance.employee_id)) {
+          continue;
+        }
         const key = `${attendance.employee_id}_attendance_record`;
         if (sourceKeySet.has(key)) {
           continue;
@@ -1808,6 +1849,57 @@ export default function SalarySignaturesPage() {
                 onChange={(e) => setBatchSendYearMonth(e.target.value)}
                 disabled={isCreatingSalaryAsignPreview}
               />
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <Label>员工 * (可多选)</Label>
+                {batchSendCompany && batchSendEmployees.length > 0 ? (
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm text-muted-foreground">
+                      已选 {batchSendEmployeeIds.length}/{batchSendEmployees.length}
+                    </span>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={handleBatchSendEmployeeToggleAll}
+                      disabled={isCreatingSalaryAsignPreview}
+                    >
+                      {batchSendEmployeeIds.length === batchSendEmployees.length ? '取消全选' : '全选'}
+                    </Button>
+                  </div>
+                ) : null}
+              </div>
+              <div className="max-h-48 space-y-2 overflow-y-auto rounded-md border p-3">
+                {!batchSendCompany ? (
+                  <p className="text-sm text-muted-foreground text-center py-4">请先选择公司</p>
+                ) : null}
+                {batchSendCompany && batchSendEmployees.length === 0 ? (
+                  <p className="text-sm text-muted-foreground text-center py-4">该公司暂无员工</p>
+                ) : null}
+                {batchSendCompany && batchSendEmployees.length > 0
+                  ? batchSendEmployees.map((employee) => (
+                      <div key={employee.id} className="flex items-center space-x-2">
+                        <Checkbox
+                          id={`salary-employee-${employee.id}`}
+                          checked={batchSendEmployeeIds.includes(employee.id)}
+                          onCheckedChange={() => handleBatchSendEmployeeToggle(employee.id)}
+                          disabled={isCreatingSalaryAsignPreview}
+                        />
+                        <label
+                          htmlFor={`salary-employee-${employee.id}`}
+                          className="text-sm font-medium leading-snug cursor-pointer peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
+                        >
+                          {employee.name}
+                          {employee.department ? (
+                            <span className="ml-2 text-muted-foreground">- {employee.department}</span>
+                          ) : null}
+                        </label>
+                      </div>
+                    ))
+                  : null}
+              </div>
             </div>
 
             <div className="space-y-2">
