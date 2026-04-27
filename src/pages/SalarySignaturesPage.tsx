@@ -55,18 +55,156 @@ import { Skeleton } from '@/components/ui/skeleton';
 import {
   getSalarySignatures,
   getAttendanceSignatures,
-  sendSalarySignatureSMS,
-  batchSendSalarySignatureSMS,
   deleteSalarySignature,
   deleteAttendanceSignature,
   updateSalarySignature,
-  getCompanies
+  getCompanies,
+  getDocumentTemplates,
+  getEmployees,
+  getSalaryRecords,
+  getSalaryItems,
+  getAttendanceRecords,
+  createSalarySignaturesBatch,
+  addAsignSignatory,
 } from '@/db/api';
-import type { SalarySignature, AttendanceSignature, Company, SalarySignatureStatus, SalarySignatureType } from '@/types/types';
+import { supabase } from '@/db/supabase';
+import { useAuth } from '@/contexts/AuthContext';
+import type {
+  SalarySignature,
+  AttendanceSignature,
+  Company,
+  SalarySignatureStatus,
+  SalarySignatureType,
+  DocumentTemplate,
+  Employee,
+} from '@/types/types';
+import type { AsignContractFillCompany, AsignContractFillEmployee } from '@/utils/asignFillData';
+import {
+  extractAsignCreateContractPreviewUrl,
+  buildAsignStrangersForSalarySigning,
+  invokeAsignTemplateCreateSigning,
+} from '@/utils/asignSalaryInvokeCreateSigning';
 import { SALARY_SIGNATURE_STATUS_LABELS, SALARY_SIGNATURE_TYPE_LABELS, ATTENDANCE_SIGNATURE_STATUS_LABELS } from '@/types/types';
 import { exportToCSV, formatDateTime } from '@/utils/exportUtils';
 
+/** 文书模板名称 → 本地薪酬签署类型（与 salary_signatures.type 对应） */
+function inferSalarySignatureTypeFromTemplateName(name: string): SalarySignatureType | null {
+  const n = (name || '').trim();
+  if (!n) {
+    return null;
+  }
+  if (n.includes('考勤')) {
+    return 'attendance_record';
+  }
+  if (n.includes('工资') || n.includes('薪') || n.includes('绩效')) {
+    return 'salary_slip';
+  }
+  return null;
+}
+
+function employeeToAsignFill(employee: Employee): AsignContractFillEmployee {
+  return {
+    name: employee.name || '',
+    id_card: employee.id_card_number || '',
+    phone: employee.phone || '',
+    email: '',
+    department: employee.department || '',
+    position: employee.position || '',
+    hire_date: employee.hire_date || '',
+    contract_start_date: employee.contract_start_date || '',
+    contract_end_date: employee.contract_end_date || '',
+    address: employee.address || '',
+    id_card_type: employee.id_card_type || '身份证',
+    gender: employee.gender || '',
+    birth_date: employee.birth_date || '',
+    insurance_start_date: employee.insurance_start_date || '',
+  };
+}
+
+function companyToAsignFill(company: Company): AsignContractFillCompany {
+  return {
+    name: company.name || '',
+    code: company.credit_no || '',
+    address: company.address || '',
+    contact_person: company.contact_person || '',
+    contact_phone: company.contact_phone || '',
+    legal_representative: company.legal_person || '',
+    payday_date: company.payday_date ?? '',
+  };
+}
+
+function toAsignFillString(v: unknown): string {
+  if (v === null || v === undefined) {
+    return '';
+  }
+  if (typeof v === 'number') {
+    return Number.isFinite(v) ? String(v) : '';
+  }
+  return String(v).trim();
+}
+
+function buildSalaryExtraFillData(data: Record<string, number | string> | undefined): Record<string, string> {
+  if (!data) {
+    return {};
+  }
+  const out: Record<string, string> = {};
+  const add = (key: string, value: unknown) => {
+    const normalized = toAsignFillString(value);
+    out[key] = normalized;
+    out[`{{${key}}}`] = normalized;
+  };
+
+  for (const [k, v] of Object.entries(data)) {
+    add(k, v);
+  }
+
+  const aliasPairs: Array<[string, string]> = [
+    ['base_salary', '基本工资'],
+    ['position_salary', '岗位工资'],
+    ['performance_bonus', '绩效奖金'],
+    ['attendance_bonus', '全勤奖'],
+    ['overtime_pay', '加班费'],
+    ['transport_allowance', '交通补贴'],
+    ['meal_allowance', '餐补'],
+    ['communication_allowance', '通讯补贴'],
+    ['gross_salary', '应发工资'],
+    ['social_insurance_personal', '社保个人部分'],
+    ['housing_fund_personal', '公积金个人部分'],
+    ['personal_income_tax', '个人所得税'],
+    ['other_deductions', '其他扣款'],
+    ['net_salary', '实发工资'],
+  ];
+
+  for (const [code, label] of aliasPairs) {
+    const codeValue = data[code];
+    const labelValue = data[label];
+    if (codeValue !== undefined) {
+      add(code, codeValue);
+      add(label, codeValue);
+    } else if (labelValue !== undefined) {
+      add(code, labelValue);
+      add(label, labelValue);
+    }
+  }
+
+  const socialValue = data.social_insurance_personal ?? data['社保个人部分'] ?? data['社保个人'];
+  if (socialValue !== undefined) {
+    add('社保个人', socialValue);
+    add('社保个人部分', socialValue);
+    add('social_insurance_personal', socialValue);
+  }
+  const housingValue = data.housing_fund_personal ?? data['公积金个人部分'] ?? data['公积金个人'];
+  if (housingValue !== undefined) {
+    add('公积金个人', housingValue);
+    add('公积金个人部分', housingValue);
+    add('housing_fund_personal', housingValue);
+  }
+
+  return out;
+}
+
 export default function SalarySignaturesPage() {
+  const { profile } = useAuth();
   const [signatures, setSignatures] = useState<SalarySignature[]>([]);
   const [attendanceSignatures, setAttendanceSignatures] = useState<AttendanceSignature[]>([]);
   const [companies, setCompanies] = useState<Company[]>([]);
@@ -79,8 +217,6 @@ export default function SalarySignaturesPage() {
   const [filterYearMonth, setFilterYearMonth] = useState<string>('');
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [signatureToDelete, setSignatureToDelete] = useState<SalarySignature | null>(null);
-  const [sendingIds, setSendingIds] = useState<Set<string>>(new Set());
-  
   // 批量选择相关状态
   const [selectedSalaryIds, setSelectedSalaryIds] = useState<string[]>([]);
   const [selectedAttendanceIds, setSelectedAttendanceIds] = useState<string[]>([]);
@@ -90,18 +226,66 @@ export default function SalarySignaturesPage() {
   const [attendanceCurrentPage, setAttendanceCurrentPage] = useState(1);
   const pageSize = 15; // 每页显示15条
   
-  // 批量发送相关状态
+  // 批量发起（爱签预览）相关状态
   const [batchSendDialogOpen, setBatchSendDialogOpen] = useState(false);
   const [batchSendCompany, setBatchSendCompany] = useState<string>('');
   const [batchSendYearMonth, setBatchSendYearMonth] = useState<string>('');
-  const [batchSendTypes, setBatchSendTypes] = useState<SalarySignatureType[]>(['salary_slip', 'attendance_record']);
-  const [batchSending, setBatchSending] = useState(false);
+  const [compensationTemplates, setCompensationTemplates] = useState<DocumentTemplate[]>([]);
+  const [batchSendTemplateIds, setBatchSendTemplateIds] = useState<string[]>([]);
+  const [isCreatingSalaryAsignPreview, setIsCreatingSalaryAsignPreview] = useState(false);
   const [batchSendProgress, setBatchSendProgress] = useState({ current: 0, total: 0 });
-  const [batchSendResults, setBatchSendResults] = useState<{ success: number; failed: number; errors: string[] }>({
-    success: 0,
-    failed: 0,
-    errors: []
-  });
+
+  const [salaryAsignPreviewOpen, setSalaryAsignPreviewOpen] = useState(false);
+  const [salaryPreviewFileUrl, setSalaryPreviewFileUrl] = useState('');
+  const [salaryBatchPreviewItems, setSalaryBatchPreviewItems] = useState<
+    Array<{ key: string; label: string; previewUrl: string }>
+  >([]);
+  const [salarySelectedBatchPreviewKey, setSalarySelectedBatchPreviewKey] = useState<string | null>(null);
+  const [salaryLaunchDrafts, setSalaryLaunchDrafts] = useState<
+    Array<{
+      key: string;
+      signaturePayload: Omit<SalarySignature, 'id' | 'created_at' | 'updated_at'>;
+      employee: Employee;
+      template: DocumentTemplate;
+      contractNo: string;
+      companyFill: AsignContractFillCompany;
+      extraFillData?: Record<string, string>;
+    }>
+  >([]);
+  const [launchingSalarySigning, setLaunchingSalarySigning] = useState(false);
+
+  useEffect(() => {
+    if (salaryBatchPreviewItems.length <= 1) {
+      setSalarySelectedBatchPreviewKey(null);
+      return;
+    }
+    setSalarySelectedBatchPreviewKey((prev) =>
+      prev != null && salaryBatchPreviewItems.some((x) => x.key === prev)
+        ? prev
+        : salaryBatchPreviewItems[0].key,
+    );
+  }, [salaryBatchPreviewItems]);
+
+  useEffect(() => {
+    if (!batchSendDialogOpen || !batchSendCompany) {
+      setCompensationTemplates([]);
+      setBatchSendTemplateIds([]);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const all = await getDocumentTemplates(batchSendCompany);
+      if (cancelled) {
+        return;
+      }
+      const comp = all.filter((t) => t.category === 'compensation' && t.is_active);
+      setCompensationTemplates(comp);
+      setBatchSendTemplateIds([]);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [batchSendDialogOpen, batchSendCompany]);
 
   useEffect(() => {
     loadData();
@@ -118,28 +302,6 @@ export default function SalarySignaturesPage() {
     setAttendanceSignatures(attendanceData);
     setCompanies(companiesData);
     setLoading(false);
-  };
-
-  const handleSendSMS = async (signature: SalarySignature) => {
-    if (!signature.employee?.phone) {
-      toast.error('员工手机号为空，无法发送短信');
-      return;
-    }
-
-    setSendingIds(prev => new Set(prev).add(signature.id));
-    const result = await sendSalarySignatureSMS(signature.id);
-    setSendingIds(prev => {
-      const newSet = new Set(prev);
-      newSet.delete(signature.id);
-      return newSet;
-    });
-
-    if (result.success) {
-      toast.success('短信发送成功');
-      loadData();
-    } else {
-      toast.error(result.error || '短信发送失败');
-    }
   };
 
   // 撤回签署
@@ -497,13 +659,8 @@ export default function SalarySignaturesPage() {
    * 下载已签署文件
    * 
    * 注意：在实际应用中，signed_file_url应该由第三方电子签系统返回
-   * 集成流程：
-   * 1. 用户点击"立即签署"按钮
-   * 2. 系统调用第三方电子签API，发送签署请求
-   * 3. 员工通过短信链接完成签署
-   * 4. 电子签系统回调通知签署完成
-   * 5. 在回调中更新salary_signatures表的signed_file_url字段为电子签系统返回的已签署文件URL
-   * 6. 用户即可通过此功能下载/查看已签署的文件
+   * 集成流程（爱签等）：发起签署、员工完成签署后，由电子签回调或同步更新
+   * salary_signatures.signed_file_url，用户即可通过此功能下载/查看已签署文件。
    */
   const handleDownloadSignedFile = (signature: SalarySignature) => {
     if (!signature.signed_file_url) {
@@ -608,20 +765,44 @@ export default function SalarySignaturesPage() {
   const attendanceEndIndex = attendanceStartIndex + pageSize;
   const paginatedAttendanceSignatures = filteredAttendanceSignatures.slice(attendanceStartIndex, attendanceEndIndex);
 
-  // 打开批量发送对话框
+  // 打开批量发起对话框
   const handleOpenBatchSend = () => {
-    // 默认设置为当前月份
     const now = new Date();
     const yearMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
     setBatchSendYearMonth(yearMonth);
     setBatchSendCompany('');
-    setBatchSendTypes(['salary_slip', 'attendance_record']); // 默认全选
-    setBatchSendResults({ success: 0, failed: 0, errors: [] });
+    setCompensationTemplates([]);
+    setBatchSendTemplateIds([]);
     setBatchSendProgress({ current: 0, total: 0 });
+    setSalaryLaunchDrafts([]);
     setBatchSendDialogOpen(true);
   };
 
-  // 执行批量发送
+  const tryCloseBatchSendDialog = () => {
+    if (isCreatingSalaryAsignPreview) {
+      toast.error('正在处理中，请稍候...');
+      return;
+    }
+    setSalaryLaunchDrafts([]);
+    setBatchSendDialogOpen(false);
+  };
+
+  const handleBatchSendDialogOpenChange = (open: boolean) => {
+    if (!open) {
+      tryCloseBatchSendDialog();
+    }
+  };
+
+  const handleCompensationTemplateToggle = (templateId: string) => {
+    setBatchSendTemplateIds((prev) => {
+      if (prev.includes(templateId)) {
+        return prev.filter((id) => id !== templateId);
+      }
+      return [...prev, templateId];
+    });
+  };
+
+  /** 第一步：通过 create-signing 生成爱签待签文件并预览（不落库签署记录） */
   const handleBatchSendConfirm = async () => {
     if (!batchSendCompany) {
       toast.error('请选择公司');
@@ -633,74 +814,342 @@ export default function SalarySignaturesPage() {
       return;
     }
 
-    if (batchSendTypes.length === 0) {
-      toast.error('请至少选择一种文件类型');
+    if (batchSendTemplateIds.length === 0) {
+      toast.error('请至少选择一种待签署文件类型（文书模板）');
       return;
+    }
+
+    const selectedTemplates = compensationTemplates.filter((t) => batchSendTemplateIds.includes(t.id));
+    const missingAsign = selectedTemplates.filter((t) => !(t.asign_template_ident || '').trim());
+    console.group('[SALARY_SIGN_TRACE] batchSend template check');
+    console.log('[SALARY_SIGN_TRACE] selectedTemplateIds', batchSendTemplateIds);
+    console.log(
+      '[SALARY_SIGN_TRACE] compensationTemplates',
+      compensationTemplates.map((t) => ({
+        id: t.id,
+        name: t.name,
+        asign_template_ident: t.asign_template_ident || '',
+      })),
+    );
+    console.log(
+      '[SALARY_SIGN_TRACE] selectedTemplates',
+      selectedTemplates.map((t) => ({
+        id: t.id,
+        name: t.name,
+        asign_template_ident: t.asign_template_ident || '',
+      })),
+    );
+    console.log(
+      '[SALARY_SIGN_TRACE] missingAsignTemplates',
+      missingAsign.map((t) => ({
+        id: t.id,
+        name: t.name,
+      })),
+    );
+    console.groupEnd();
+    if (missingAsign.length > 0) {
+      toast.error(
+        `以下文书未配置爱签模板编号，无法创建预览：${missingAsign.map((t) => t.name).join('、')}`,
+      );
+      return;
+    }
+
+    const typeByTemplate = new Map<string, SalarySignatureType>();
+    for (const t of selectedTemplates) {
+      const st = inferSalarySignatureTypeFromTemplateName(t.name);
+      if (!st) {
+        toast.error(
+          `文书「${t.name}」无法匹配签署类型，请将模板名称包含「工资」「薪」「绩效」或「考勤」之一。`,
+        );
+        return;
+      }
+      typeByTemplate.set(t.id, st);
     }
 
     const [year, month] = batchSendYearMonth.split('-').map(Number);
+    const monthText = `${year}-${String(month).padStart(2, '0')}`;
 
-    // 筛选待发送的签署记录（根据选择的文件类型）
-    const pendingSignatures = signatures.filter(sig => 
-      sig.company_id === batchSendCompany &&
-      sig.year === year &&
-      sig.month === month &&
-      sig.status === 'pending' &&
-      batchSendTypes.includes(sig.type)
-    );
-
-    if (pendingSignatures.length === 0) {
-      toast.error('没有找到待签署的记录');
-      return;
-    }
-
-    setBatchSending(true);
-    setBatchSendProgress({ current: 0, total: pendingSignatures.length });
-    
-    // 使用批量发送API
-    const signatureIds = pendingSignatures.map(sig => sig.id);
-    const result = await batchSendSalarySignatureSMS(signatureIds);
-
-    setBatchSendProgress({ current: result.successCount + result.failCount, total: pendingSignatures.length });
-    
-    const results = {
-      success: result.successCount,
-      failed: result.failCount,
-      errors: result.errors
-    };
-
-    setBatchSendResults(results);
-    setBatchSending(false);
-
-    // 显示结果
-    if (results.failed === 0) {
-      toast.success(`批量发送成功！共发送 ${results.success} 条短信`);
-    } else {
-      toast.warning(`发送完成：成功 ${results.success} 条，失败 ${results.failed} 条`);
-    }
-
-    // 刷新数据
-    await loadData();
-  };
-
-  // 处理文件类型选择
-  const handleTypeToggle = (type: SalarySignatureType) => {
-    setBatchSendTypes(prev => {
-      if (prev.includes(type)) {
-        return prev.filter(t => t !== type);
-      } else {
-        return [...prev, type];
+    const allowedTypes = new Set<SalarySignatureType>();
+    for (const tid of batchSendTemplateIds) {
+      const st = typeByTemplate.get(tid);
+      if (st) {
+        allowedTypes.add(st);
       }
-    });
-  };
+    }
 
-  // 关闭批量发送对话框
-  const handleCloseBatchSend = () => {
-    if (batchSending) {
-      toast.error('正在发送中，请稍候...');
+    const employees = await getEmployees(batchSendCompany);
+    const empById = new Map(employees.map((e) => [e.id, e]));
+    const sourceUnits: Array<{
+      employee_id: string;
+      type: SalarySignatureType;
+      reference_id: string;
+      salaryData?: Record<string, number | string>;
+    }> = [];
+    const sourceKeySet = new Set<string>();
+
+    if (allowedTypes.has('salary_slip')) {
+      const salaryRecords = await getSalaryRecords(batchSendCompany, year, month);
+      for (const record of salaryRecords) {
+        const items = await getSalaryItems(record.id);
+        for (const item of items) {
+          const key = `${item.employee_id}_salary_slip`;
+          if (sourceKeySet.has(key)) {
+            continue;
+          }
+          sourceUnits.push({
+            employee_id: item.employee_id,
+            type: 'salary_slip',
+            reference_id: record.id,
+            salaryData: item.data,
+          });
+          sourceKeySet.add(key);
+        }
+      }
+    }
+
+    if (allowedTypes.has('attendance_record')) {
+      const attendanceRecords = await getAttendanceRecords(batchSendCompany, monthText);
+      for (const attendance of attendanceRecords) {
+        const key = `${attendance.employee_id}_attendance_record`;
+        if (sourceKeySet.has(key)) {
+          continue;
+        }
+        sourceUnits.push({
+          employee_id: attendance.employee_id,
+          type: 'attendance_record',
+          reference_id: attendance.id,
+        });
+        sourceKeySet.add(key);
+      }
+    }
+
+    if (sourceUnits.length === 0) {
+      toast.error('未找到可用于创建待签文件的数据源（工资条/考勤）');
       return;
     }
-    setBatchSendDialogOpen(false);
+
+    const company = companies.find((c) => c.id === batchSendCompany);
+    if (!company) {
+      toast.error('公司信息无效');
+      return;
+    }
+
+    const needsCompanySigner = selectedTemplates.some((t) => t.requires_company_signature);
+    const companyFill = companyToAsignFill(company);
+    if (needsCompanySigner) {
+      if (
+        !companyFill.name ||
+        !companyFill.code ||
+        !companyFill.address ||
+        !companyFill.contact_person ||
+        !companyFill.contact_phone ||
+        !companyFill.legal_representative
+      ) {
+        toast.error(
+          '所选文书需要企业签署，请先在「公司」档案中补全名称、统一社会信用代码、地址、联系人、电话、法定代表人',
+        );
+        return;
+      }
+    }
+
+    type WorkUnit = {
+      source: {
+        employee_id: string;
+        type: SalarySignatureType;
+        reference_id: string;
+        salaryData?: Record<string, number | string>;
+      };
+      template: DocumentTemplate;
+    };
+    const workUnits: WorkUnit[] = [];
+    for (const template of selectedTemplates) {
+      const st = typeByTemplate.get(template.id);
+      if (!st) {
+        continue;
+      }
+      for (const src of sourceUnits) {
+        if (src.type !== st) {
+          continue;
+        }
+        workUnits.push({ source: src, template });
+      }
+    }
+
+    if (workUnits.length === 0) {
+      toast.error('没有可生成预览的「模板 × 待签记录」组合');
+      return;
+    }
+
+    const fullName = typeof profile?.full_name === 'string' ? profile.full_name : '';
+    const username = typeof profile?.username === 'string' ? profile.username : '';
+    const displayName = (fullName || username || 'unknown').trim();
+    const userId = profile?.id ?? 'unknown';
+
+    setIsCreatingSalaryAsignPreview(true);
+    setBatchSendProgress({ current: 0, total: workUnits.length });
+
+    try {
+      const previewItems: Array<{ key: string; label: string; previewUrl: string }> = [];
+      const launchDrafts: Array<{
+        key: string;
+        signaturePayload: Omit<SalarySignature, 'id' | 'created_at' | 'updated_at'>;
+        employee: Employee;
+        template: DocumentTemplate;
+        contractNo: string;
+        companyFill: AsignContractFillCompany;
+        extraFillData?: Record<string, string>;
+      }> = [];
+      let idx = 0;
+      for (const unit of workUnits) {
+        idx += 1;
+        const emp = empById.get(unit.source.employee_id);
+        if (!emp) {
+          toast.error(`找不到员工档案：${unit.source.employee_id}`);
+          return;
+        }
+        const fillEmp = employeeToAsignFill(emp);
+        const idCard = (fillEmp.id_card || '').trim();
+        const mobile = (fillEmp.phone || '').trim();
+        if (!idCard || !mobile) {
+          toast.error(`员工「${fillEmp.name || emp.id}」缺少身份证号或手机号，无法创建爱签预览`);
+          return;
+        }
+
+        const needsCo = unit.template.requires_company_signature;
+        const strang = buildAsignStrangersForSalarySigning(
+          fillEmp,
+          needsCo ? companyFill : undefined,
+        );
+        if (strang.length === 0) {
+          toast.error('爱签签署方列表为空，请检查员工手机号与（如需）企业盖章信息');
+          return;
+        }
+
+        toast.info(`正在创建爱签合同（${idx}/${workUnits.length}）…`);
+        const result = await invokeAsignTemplateCreateSigning(supabase, {
+          docTemplate: unit.template,
+          fillEmployee: fillEmp,
+          companyForFill: companyFill,
+          strangers: strang,
+          extraFillData: buildSalaryExtraFillData(unit.source.salaryData),
+          contractNoNonce: `sx${idx}`,
+          displayName,
+          userId,
+          suppressTemplateCreateToast: true,
+        });
+        const previewUrl = extractAsignCreateContractPreviewUrl(
+          result.asign,
+          result.effectiveContractNo,
+        );
+        if (!previewUrl) {
+          throw new Error('创建签署文件未返回预览地址（previewUrl），请稍后重试或联系管理员。');
+        }
+        previewItems.push({
+          key: `${unit.source.employee_id}_${unit.source.type}_${unit.template.id}_${idx}`,
+          label: `${idx}. ${fillEmp.name || emp.id} · ${unit.template.name}`,
+          previewUrl,
+        });
+        launchDrafts.push({
+          key: `${unit.source.employee_id}_${unit.source.type}_${unit.template.id}_${idx}`,
+          signaturePayload: {
+            company_id: batchSendCompany,
+            employee_id: unit.source.employee_id,
+            type: unit.source.type,
+            reference_id: unit.source.reference_id,
+            year,
+            month,
+            status: 'pending',
+          },
+          employee: emp,
+          template: unit.template,
+          contractNo: result.effectiveContractNo,
+          companyFill,
+          extraFillData: buildSalaryExtraFillData(unit.source.salaryData),
+        });
+        setBatchSendProgress({ current: idx, total: workUnits.length });
+      }
+
+      setSalaryLaunchDrafts(launchDrafts);
+      setSalaryBatchPreviewItems(previewItems);
+      const firstUrl = previewItems[0]?.previewUrl || '';
+      setSalaryPreviewFileUrl(firstUrl);
+      setBatchSendDialogOpen(false);
+      setSalaryAsignPreviewOpen(true);
+      toast.success('已创建待签文件，请预览后点击「立即发起」。');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error('创建爱签预览失败', { description: msg, duration: 6000 });
+    } finally {
+      setIsCreatingSalaryAsignPreview(false);
+    }
+  };
+
+  /** 第二步：添加签署人并创建签署记录 */
+  const handleLaunchSalarySigning = async () => {
+    if (salaryLaunchDrafts.length === 0) {
+      toast.error('没有可发起的待签文件，请先创建预览');
+      return;
+    }
+
+    setLaunchingSalarySigning(true);
+    try {
+      const payloadKeySet = new Set(
+        signatures
+          .filter((sig) => sig.company_id === batchSendCompany)
+          .map((sig) => `${sig.employee_id}_${sig.type}_${sig.reference_id}`),
+      );
+      const signaturePayloads: Omit<SalarySignature, 'id' | 'created_at' | 'updated_at'>[] = [];
+
+      let step = 0;
+      for (const draft of salaryLaunchDrafts) {
+        step += 1;
+        toast.info(`正在添加签署人并发起（${step}/${salaryLaunchDrafts.length}）…`);
+        const fillEmp = employeeToAsignFill(draft.employee);
+        const strangers = buildAsignStrangersForSalarySigning(
+          fillEmp,
+          draft.template.requires_company_signature ? draft.companyFill : undefined,
+        );
+        const signers = strangers.map((s, index) => ({
+          account: s.account,
+          noticeMobile: s.mobile,
+          signType: 3,
+          isNotice: 1,
+          signOrder: String(index + 1),
+        }));
+        const addRes = await addAsignSignatory({
+          contractNo: draft.contractNo,
+          signers,
+        });
+        if (!addRes.success) {
+          throw new Error(addRes.error || `合同 ${draft.contractNo} 添加签署方失败`);
+        }
+
+        const k = `${draft.signaturePayload.employee_id}_${draft.signaturePayload.type}_${draft.signaturePayload.reference_id}`;
+        if (!payloadKeySet.has(k)) {
+          signaturePayloads.push(draft.signaturePayload);
+          payloadKeySet.add(k);
+        }
+      }
+
+      if (signaturePayloads.length > 0) {
+        const ok = await createSalarySignaturesBatch(signaturePayloads);
+        if (!ok) {
+          throw new Error('创建签署记录失败');
+        }
+      }
+
+      await loadData();
+      setSalaryAsignPreviewOpen(false);
+      setSalaryBatchPreviewItems([]);
+      setSalaryPreviewFileUrl('');
+      setSalaryLaunchDrafts([]);
+      toast.success(`发起成功，已处理 ${salaryLaunchDrafts.length} 份合同`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error('立即发起失败', { description: msg, duration: 6000 });
+    } finally {
+      setLaunchingSalarySigning(false);
+    }
   };
 
   // 过滤签署记录
@@ -943,44 +1392,22 @@ export default function SalarySignaturesPage() {
                               <TableCell className="text-right whitespace-nowrap">
                                 <div className="flex justify-end gap-2">
                                   {signature.status === 'pending' && (
-                                    <>
-                                      <Button
-                                        variant="default"
-                                        size="sm"
-                                        onClick={() => handleSendSMS(signature)}
-                                        disabled={sendingIds.has(signature.id)}
-                                      >
-                                        <Send className="h-4 w-4 mr-1" />
-                                        {sendingIds.has(signature.id) ? '发送中...' : '立即签署'}
-                                      </Button>
-                                      <Button
-                                        variant="secondary"
-                                        size="sm"
-                                        onClick={() => handleRevoke(signature)}
-                                      >
-                                        撤回
-                                      </Button>
-                                    </>
+                                    <Button
+                                      variant="secondary"
+                                      size="sm"
+                                      onClick={() => handleRevoke(signature)}
+                                    >
+                                      撤回
+                                    </Button>
                                   )}
                                   {signature.status === 'sent' && (
-                                    <>
-                                      <Button
-                                        variant="outline"
-                                        size="sm"
-                                        onClick={() => handleSendSMS(signature)}
-                                        disabled={sendingIds.has(signature.id)}
-                                      >
-                                        <Send className="h-4 w-4 mr-1" />
-                                        {sendingIds.has(signature.id) ? '发送中...' : '重新发送'}
-                                      </Button>
-                                      <Button
-                                        variant="secondary"
-                                        size="sm"
-                                        onClick={() => handleRevoke(signature)}
-                                      >
-                                        撤回
-                                      </Button>
-                                    </>
+                                    <Button
+                                      variant="secondary"
+                                      size="sm"
+                                      onClick={() => handleRevoke(signature)}
+                                    >
+                                      撤回
+                                    </Button>
                                   )}
                                   {signature.status === 'signed' && (
                                     <Button
@@ -1343,13 +1770,13 @@ export default function SalarySignaturesPage() {
         </AlertDialogContent>
       </AlertDialog>
 
-      {/* 批量发送对话框 */}
-      <Dialog open={batchSendDialogOpen} onOpenChange={handleCloseBatchSend}>
-        <DialogContent className="sm:max-w-[500px]">
+      {/* 批量发起：爱签 create-signing 预览 */}
+      <Dialog open={batchSendDialogOpen} onOpenChange={handleBatchSendDialogOpenChange}>
+        <DialogContent className="max-w-5xl max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>一键发起薪酬签署</DialogTitle>
             <DialogDescription>
-              选择公司和年月，系统将向该公司所有待签署的员工发送短信
+              选择公司、年月及「薪酬管理」文书模板；系统将调用爱签生成待签文件供预览确认。
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-4">
@@ -1358,7 +1785,7 @@ export default function SalarySignaturesPage() {
               <Select
                 value={batchSendCompany}
                 onValueChange={setBatchSendCompany}
-                disabled={batchSending}
+                disabled={isCreatingSalaryAsignPreview}
               >
                 <SelectTrigger id="batch-company">
                   <SelectValue placeholder="请选择公司" />
@@ -1379,50 +1806,50 @@ export default function SalarySignaturesPage() {
                 type="month"
                 value={batchSendYearMonth}
                 onChange={(e) => setBatchSendYearMonth(e.target.value)}
-                disabled={batchSending}
+                disabled={isCreatingSalaryAsignPreview}
               />
             </div>
 
-            {/* 文件类型选择 */}
             <div className="space-y-2">
               <Label>待签署文件类型 *</Label>
-              <div className="flex gap-6">
-                <div className="flex items-center space-x-2">
-                  <Checkbox
-                    id="type-salary-slip"
-                    checked={batchSendTypes.includes('salary_slip')}
-                    onCheckedChange={() => handleTypeToggle('salary_slip')}
-                    disabled={batchSending}
-                  />
-                  <label
-                    htmlFor="type-salary-slip"
-                    className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 cursor-pointer"
-                  >
-                    工资条
-                  </label>
+              {/* <p className="text-xs text-muted-foreground">
+                来自文书模板中「薪酬管理」分类；模板名称需含「工资/薪/绩效」或「考勤」以对应系统中的工资条或考勤待签记录。
+              </p> */}
+              {!batchSendCompany ? (
+                <p className="text-sm text-muted-foreground">请先选择公司以加载模板</p>
+              ) : compensationTemplates.length === 0 ? (
+                <p className="text-sm text-muted-foreground">
+                  该公司暂无启用的薪酬管理文书模板，请先在「文书模板」中维护（分类选薪酬管理）。
+                </p>
+              ) : (
+                <div className="max-h-48 space-y-2 overflow-y-auto rounded-md border p-3">
+                  {compensationTemplates.map((tpl) => (
+                    <div key={tpl.id} className="flex items-center space-x-2">
+                      <Checkbox
+                        id={`salary-tpl-${tpl.id}`}
+                        
+                        onCheckedChange={() => handleCompensationTemplateToggle(tpl.id)}
+                        disabled={isCreatingSalaryAsignPreview}
+                      />
+                      <label
+                        htmlFor={`salary-tpl-${tpl.id}`}
+                        className="text-sm font-medium leading-snug cursor-pointer peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
+                      >
+                        {tpl.name}
+                        {!(tpl.asign_template_ident || '').trim() ? (
+                          <span className="ml-2 text-xs text-destructive">（未配爱签模板编号）</span>
+                        ) : null}
+                      </label>
+                    </div>
+                  ))}
                 </div>
-                <div className="flex items-center space-x-2">
-                  <Checkbox
-                    id="type-attendance-record"
-                    checked={batchSendTypes.includes('attendance_record')}
-                    onCheckedChange={() => handleTypeToggle('attendance_record')}
-                    disabled={batchSending}
-                  />
-                  <label
-                    htmlFor="type-attendance-record"
-                    className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 cursor-pointer"
-                  >
-                    考勤确认表
-                  </label>
-                </div>
-              </div>
+              )}
             </div>
 
-            {/* 发送进度 */}
-            {batchSending && (
+            {isCreatingSalaryAsignPreview && batchSendProgress.total > 0 && (
               <div className="space-y-2">
                 <div className="flex justify-between text-sm">
-                  <span>发送进度</span>
+                  <span>创建预览进度</span>
                   <span>{batchSendProgress.current} / {batchSendProgress.total}</span>
                 </div>
                 <div className="w-full bg-secondary rounded-full h-2">
@@ -1435,50 +1862,117 @@ export default function SalarySignaturesPage() {
                 </div>
               </div>
             )}
-
-            {/* 发送结果 */}
-            {!batchSending && batchSendResults.success + batchSendResults.failed > 0 && (
-              <div className="space-y-2 p-4 bg-muted rounded-lg">
-                <div className="font-medium">发送结果</div>
-                <div className="text-sm space-y-1">
-                  <div className="flex justify-between">
-                    <span>成功：</span>
-                    <span className="text-green-600 font-medium">{batchSendResults.success} 条</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span>失败：</span>
-                    <span className="text-red-600 font-medium">{batchSendResults.failed} 条</span>
-                  </div>
-                </div>
-                {batchSendResults.errors.length > 0 && (
-                  <div className="mt-2 space-y-1">
-                    <div className="text-sm font-medium text-destructive">失败详情：</div>
-                    <div className="text-xs space-y-1 max-h-32 overflow-y-auto">
-                      {batchSendResults.errors.map((error, index) => (
-                        <div key={index} className="text-muted-foreground">• {error}</div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
           </div>
           <DialogFooter>
             <Button
               variant="outline"
-              onClick={handleCloseBatchSend}
-              disabled={batchSending}
+              onClick={tryCloseBatchSendDialog}
+              disabled={isCreatingSalaryAsignPreview}
             >
-              {batchSendResults.success + batchSendResults.failed > 0 ? '关闭' : '取消'}
+              取消
             </Button>
-            {batchSendResults.success + batchSendResults.failed === 0 && (
-              <Button
-                onClick={handleBatchSendConfirm}
-                disabled={batchSending}
-              >
-                {batchSending ? '发送中...' : '开始发送'}
-              </Button>
+            <Button
+              onClick={handleBatchSendConfirm}
+              disabled={isCreatingSalaryAsignPreview}
+            >
+              {isCreatingSalaryAsignPreview ? '创建预览中…' : '发起签署'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={salaryAsignPreviewOpen}
+        onOpenChange={(open) => {
+          if (!open) {
+            if (launchingSalarySigning) {
+              toast.error('正在发起签署，请稍候…');
+              return;
+            }
+            setSalaryAsignPreviewOpen(false);
+            setSalaryBatchPreviewItems([]);
+            setSalaryPreviewFileUrl('');
+            setSalaryLaunchDrafts([]);
+          }
+        }}
+      >
+        <DialogContent className="max-w-4xl h-[80vh]">
+          <DialogHeader>
+            <DialogTitle>爱签待签署文件预览</DialogTitle>
+            <DialogDescription>请核对爱签生成的待签文件内容。</DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-1 flex-col gap-3 overflow-hidden">
+            {salaryBatchPreviewItems.length > 1 && (
+              <div className="flex flex-wrap gap-2">
+                {salaryBatchPreviewItems.map((item) => {
+                  const activeKey =
+                    salarySelectedBatchPreviewKey ?? salaryBatchPreviewItems[0]?.key ?? '';
+                  const isActive = item.key === activeKey;
+                  return (
+                    <Button
+                      key={item.key}
+                      type="button"
+                      size="sm"
+                      variant={isActive ? 'default' : 'outline'}
+                      onClick={() => {
+                        setSalarySelectedBatchPreviewKey(item.key);
+                        setSalaryPreviewFileUrl(item.previewUrl);
+                      }}
+                    >
+                      {item.label}
+                    </Button>
+                  );
+                })}
+              </div>
             )}
+            <div className="min-h-0 flex-1 overflow-hidden rounded-md border">
+              {salaryPreviewFileUrl ? (
+                <iframe
+                  key={
+                    salaryBatchPreviewItems.length > 1
+                      ? `${salarySelectedBatchPreviewKey ?? salaryBatchPreviewItems[0]?.key ?? 'batch'}:${salaryPreviewFileUrl}`
+                      : salaryPreviewFileUrl
+                  }
+                  src={salaryPreviewFileUrl}
+                  className="h-[calc(80vh-200px)] w-full border-0"
+                  title="爱签预览"
+                />
+              ) : (
+                <div className="flex h-[calc(80vh-200px)] items-center justify-center text-sm text-muted-foreground">
+                  无预览地址
+                </div>
+              )}
+            </div>
+          </div>
+          <DialogFooter className="gap-2 sm:justify-between">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => window.open(salaryPreviewFileUrl, '_blank')}
+              disabled={!salaryPreviewFileUrl}
+            >
+              在新标签页打开
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => {
+                setSalaryAsignPreviewOpen(false);
+                setSalaryBatchPreviewItems([]);
+                setSalaryPreviewFileUrl('');
+                setSalaryLaunchDrafts([]);
+              }}
+              disabled={launchingSalarySigning}
+            >
+              关闭
+            </Button>
+            <Button
+              type="button"
+              onClick={handleLaunchSalarySigning}
+              disabled={launchingSalarySigning || salaryLaunchDrafts.length === 0}
+            >
+              {launchingSalarySigning ? '发起中…' : '立即发起'}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
