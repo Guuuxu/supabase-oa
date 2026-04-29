@@ -6,6 +6,11 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import type { DocumentTemplate } from '@/types/types';
 import type { AsignContractFillCompany, AsignContractFillEmployee } from '@/utils/asignFillData';
 import { buildAsignFillDataForContract } from '@/utils/asignFillData';
+import { getAsignTemplateData } from '@/db/api';
+import {
+  extractAsignTemplateControlHints,
+  type AsignTemplateControlHints,
+} from '@/utils/extractAsignTemplateControlHints';
 
 export type AsignStrangerItem = {
   account: string;
@@ -241,6 +246,8 @@ export type InvokeAsignTemplateCreateResult = {
   effectiveContractNo: string;
   contractName: string;
   asign: unknown;
+  /** 由 get-asign-template-data 解析；create-signing 返回体通常不含控件树 */
+  asignTemplateHints?: AsignTemplateControlHints;
 };
 
 /**
@@ -341,10 +348,23 @@ export async function invokeAsignTemplateCreateSigning(
 
   const effectiveContractNo = extractContractNoFromCreateSigningResponse(data, contractNo);
 
+  let asignTemplateHints: AsignTemplateControlHints | undefined;
+  const ident = String(docTemplate.asign_template_ident || '').trim();
+  if (ident) {
+    const tplRes = await getAsignTemplateData({ template_ident: ident });
+    if (tplRes.ok) {
+      const parsed = extractAsignTemplateControlHints(tplRes.data);
+      if (parsed.signKeys.length > 0) {
+        asignTemplateHints = parsed;
+      }
+    }
+  }
+
   return {
     contractNo,
     effectiveContractNo,
     contractName,
     asign: data,
+    asignTemplateHints,
   };
 }

@@ -11,7 +11,10 @@
 import { serve } from "https://deno.land/std/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { callAsignDownloadContract } from "../_shared/asign-client.ts";
-import { uploadPdfBytesAndAttachToSigningRecords } from "../_shared/signed-file-persist.ts";
+import {
+  uploadPdfBytesAndAttachToSalarySignatures,
+  uploadPdfBytesAndAttachToSigningRecords,
+} from "../_shared/signed-file-persist.ts";
 import { corsHeaders } from "../_shared/cors.ts";
 
 const LOG = "[DOWNLOAD_ASIGN_CONTRACT]";
@@ -114,6 +117,9 @@ serve(async (req) => {
   const userSb = createClient(supabaseUrl, supabaseAnonKey, {
     global: { headers: authHeader ? { Authorization: authHeader } : {} },
   });
+  const admin = createClient(supabaseAdminUrl, serviceKey, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  });
 
   const { data: { user }, error: userErr } = await userSb.auth.getUser();
   if (userErr || !user) {
@@ -181,6 +187,7 @@ serve(async (req) => {
     return jsonResponse({ ok: false, error: "请提供 signing_record_id 或 contract_no", version: FN_VERSION }, 400);
   }
 
+  let persistTarget: "signing_records" | "salary_signatures" = "signing_records";
   if (!signingRecordId) {
     // contract_no 模式：要求该合同号关联的所有签署记录均已 completed
     const { data: rows, error: rowsErr } = await userSb
@@ -192,14 +199,43 @@ serve(async (req) => {
     }
     const list = rows ?? [];
     if (list.length === 0) {
-      return jsonResponse({ ok: false, error: "未找到该合同号对应的签署记录", version: FN_VERSION }, 200);
-    }
-    const notCompleted = list.filter((r: any) => String(r.status ?? "").trim() !== "completed");
-    if (notCompleted.length > 0) {
-      return jsonResponse(
-        { ok: false, error: "存在未完成的签署记录，禁止下载同步，请待全部 completed 后再操作", version: FN_VERSION },
-        200,
-      );
+      const { data: salaryRows, error: salaryErr } = await userSb
+        .from("salary_signatures")
+        .select("id")
+        .eq("third_party_contract_no", contractNo);
+      // 兜底：避免 RLS/权限导致误判「不存在」；是否可操作由前面的登录与业务流程控制。
+      const { data: salaryRowsByAdmin, error: salaryAdminErr } = await admin
+        .from("salary_signatures")
+        .select("id")
+        .eq("third_party_contract_no", contractNo);
+      if (salaryErr) {
+        return jsonResponse({ ok: false, error: salaryErr.message, version: FN_VERSION }, 200);
+      }
+      if (salaryAdminErr) {
+        return jsonResponse({ ok: false, error: salaryAdminErr.message, version: FN_VERSION }, 200);
+      }
+      const salaryCountByUser = (salaryRows ?? []).length;
+      const salaryCountByAdmin = (salaryRowsByAdmin ?? []).length;
+      if (salaryCountByAdmin === 0) {
+        return jsonResponse(
+          {
+            ok: false,
+            error: `未找到该合同号对应的签署记录（contractNo=${contractNo}）`,
+            version: FN_VERSION,
+            detail: { salaryCountByUser, salaryCountByAdmin },
+          },
+          200,
+        );
+      }
+      persistTarget = "salary_signatures";
+    } else {
+      const notCompleted = list.filter((r: any) => String(r.status ?? "").trim() !== "completed");
+      if (notCompleted.length > 0) {
+        return jsonResponse(
+          { ok: false, error: "存在未完成的签署记录，禁止下载同步，请待全部 completed 后再操作", version: FN_VERSION },
+          200,
+        );
+      }
     }
   }
 
@@ -252,15 +288,17 @@ serve(async (req) => {
     bytesHead: Array.from(dl.bytes.slice(0, 8)),
   });
 
-  const admin = createClient(supabaseAdminUrl, serviceKey, {
-    auth: { autoRefreshToken: false, persistSession: false },
-  });
-
-  const persist = await uploadPdfBytesAndAttachToSigningRecords(admin, dl.bytes, {
-    contractNo,
-    uploadedBy: user.id,
-    fileNamePrefix: "asign-pull",
-  });
+  const persist = persistTarget === "salary_signatures"
+    ? await uploadPdfBytesAndAttachToSalarySignatures(admin, dl.bytes, {
+      contractNo,
+      uploadedBy: user.id,
+      fileNamePrefix: "salary-asign-pull",
+    })
+    : await uploadPdfBytesAndAttachToSigningRecords(admin, dl.bytes, {
+      contractNo,
+      uploadedBy: user.id,
+      fileNamePrefix: "asign-pull",
+    });
 
   if (!persist.ok) {
     console.error(LOG, "落库失败", persist.error);
@@ -274,11 +312,17 @@ serve(async (req) => {
 
     if (isStorageSignatureError) {
       console.warn(LOG, "触发用户态兜底重试（storage invalid signature）");
-      const retry = await uploadPdfBytesAndAttachToSigningRecords(userSb as any, dl.bytes, {
-        contractNo,
-        uploadedBy: user.id,
-        fileNamePrefix: "asign-pull",
-      });
+      const retry = persistTarget === "salary_signatures"
+        ? await uploadPdfBytesAndAttachToSalarySignatures(userSb as any, dl.bytes, {
+          contractNo,
+          uploadedBy: user.id,
+          fileNamePrefix: "salary-asign-pull",
+        })
+        : await uploadPdfBytesAndAttachToSigningRecords(userSb as any, dl.bytes, {
+          contractNo,
+          uploadedBy: user.id,
+          fileNamePrefix: "asign-pull",
+        });
       if (retry.ok) {
         console.log(LOG, "用户态兜底成功", retry.publicUrl, retry.updatedRecordCount);
         return jsonResponse(

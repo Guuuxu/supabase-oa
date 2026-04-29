@@ -370,6 +370,8 @@ export default function SalaryRecordsPage() {
         company_id: formData.company_id,
         employee_id: item.employee_id,
         type: 'salary_slip' as const,
+        document_template_id: formData.template_id,
+        document_name: template.name,
         reference_id: salaryRecord.id,
         year: formData.year,
         month: formData.month,

@@ -849,6 +849,15 @@ export async function callAsignDownloadContract(args: {
   const timeoutMs = Math.max(5000, parseInt(timeoutMsRaw, 10) || 60000);
 
   let lastFailure: { ok: false; status: number; data: unknown; debug?: unknown } | null = null;
+  const downloadTraceLog = (
+    stage: string,
+    payload: Record<string, unknown>,
+  ) => {
+    console.log("[ASIGN_SYNC_TRACE]", stage, {
+      contractNo: String(args.contractNo).trim(),
+      ...payload,
+    });
+  };
 
   const parseDownloadResponse = async (
     res: Response,
@@ -860,12 +869,29 @@ export async function callAsignDownloadContract(args: {
   > => {
     const buf = await res.arrayBuffer();
     const bytes = new Uint8Array(buf);
+    downloadTraceLog("parse_response_start", {
+      attemptTag,
+      status: res.status,
+      ok: res.ok,
+      contentType: res.headers.get("content-type") ?? "",
+      contentLength: res.headers.get("content-length") ?? "",
+      byteLength: bytes.byteLength,
+      bytesHead: Array.from(bytes.slice(0, 16)),
+    });
 
     if (res.ok && isPdfMagic(bytes)) {
+      downloadTraceLog("parse_response_pdf_magic", {
+        attemptTag,
+        byteLength: bytes.byteLength,
+      });
       return { ok: true, bytes };
     }
 
     if (res.ok && bytes.length > 4 && bytes[0] === 0x50 && bytes[1] === 0x4b) {
+      downloadTraceLog("parse_response_zip", {
+        attemptTag,
+        byteLength: bytes.byteLength,
+      });
       return {
         ok: false,
         failure: {
@@ -892,18 +918,35 @@ export async function callAsignDownloadContract(args: {
       const asign = (parsedRecord.asign ?? parsedRecord) as Record<string, unknown>;
       const asignCode = asign?.code;
       const isAsignError = !isAsignBizSuccessResponse(asign);
+      downloadTraceLog("parse_response_json", {
+        attemptTag,
+        asignCode: asign?.code ?? null,
+        asignMsg: typeof asign?.msg === "string" ? String(asign.msg).slice(0, 200) : asign?.msg ?? null,
+        isAsignError,
+      });
       if (res.ok && !isAsignError) {
         const b64 = findLongBase64InObject(parsed);
+        downloadTraceLog("parse_response_json_success", {
+          attemptTag,
+          hasBase64Candidate: Boolean(b64),
+          base64Length: b64 ? b64.length : 0,
+        });
         if (b64) {
           try {
             const pdfBytes = base64ToBytes(b64);
+            downloadTraceLog("parse_response_base64_decoded", {
+              attemptTag,
+              decodedByteLength: pdfBytes.byteLength,
+              decodedBytesHead: Array.from(pdfBytes.slice(0, 16)),
+              isPdfMagic: isPdfMagic(pdfBytes),
+            });
             if (isPdfMagic(pdfBytes)) {
               return { ok: true, bytes: pdfBytes };
             }
-            if (pdfBytes.length > 500) {
-              return { ok: true, bytes: pdfBytes };
-            }
           } catch {
+            downloadTraceLog("parse_response_base64_decode_failed", {
+              attemptTag,
+            });
             /* noop */
           }
         }

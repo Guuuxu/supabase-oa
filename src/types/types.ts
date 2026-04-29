@@ -498,6 +498,10 @@ export interface SalarySignature {
   company_id: string;
   employee_id: string;
   type: SalarySignatureType;
+  /** 发起签署使用的文书模板（可选，与 document_name 一并写入） */
+  document_template_id?: string | null;
+  /** 文书名称，与文书签署详情中文书列表取值一致（冗余字段） */
+  document_name?: string | null;
   reference_id: string; // 关联的工资记录或考勤记录ID
   year: number;
   month: number;
@@ -505,6 +509,7 @@ export interface SalarySignature {
   sent_at?: string;
   signed_at?: string;
   signature_url?: string;
+  third_party_contract_no?: string; // 第三方电子签合同号（回调用于定位）
   sign_token?: string; // 签署token
   sign_token_expires_at?: string; // token过期时间
   original_file_url?: string; // 原始文件URL

@@ -10,11 +10,14 @@ import { serve } from "https://deno.land/std/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { corsHeaders } from "../_shared/cors.ts";
 import {
+  applyExternalSignedFileUrlToSalarySignatures,
   applyExternalSignedFileUrlToSigningRecords,
+  uploadPdfBytesAndAttachToSalarySignatures,
   uploadPdfBytesAndAttachToSigningRecords,
 } from "../_shared/signed-file-persist.ts";
 
 const LOG = "[ASIGN_NOTIFY]";
+const ROUTE_LOG = "[ASIGN_NOTIFY_ROUTE]";
 
 function textResponse(body: string, status = 200) {
   return new Response(body, {
@@ -175,6 +178,70 @@ async function updateSigningStatusByContractNo(
     return;
   }
   console.log(LOG, "回写签署状态成功:", nextStatus, "记录数:", ids.length);
+}
+
+type NotifyTarget = "salary_signatures" | "signing_records" | "conflict" | "none";
+
+async function resolveNotifyTarget(
+  admin: ReturnType<typeof createClient>,
+  contractNo: string,
+): Promise<NotifyTarget> {
+  const { data: salaryRows, error: salaryErr } = await admin
+    .from("salary_signatures")
+    .select("id")
+    .eq("third_party_contract_no", contractNo);
+  if (salaryErr) {
+    console.error(ROUTE_LOG, "查询 salary_signatures 失败:", salaryErr.message);
+    return "none";
+  }
+
+  const { data: signingRows, error: signingErr } = await admin
+    .from("signing_records")
+    .select("id")
+    .eq("third_party_contract_no", contractNo);
+  if (signingErr) {
+    console.error(ROUTE_LOG, "查询 signing_records 失败:", signingErr.message);
+    return "none";
+  }
+
+  const salaryCount = Array.isArray(salaryRows) ? salaryRows.length : 0;
+  const signingCount = Array.isArray(signingRows) ? signingRows.length : 0;
+  console.log(ROUTE_LOG, "合同号路由命中统计", { contractNo, salaryCount, signingCount });
+
+  if (salaryCount > 0 && signingCount === 0) return "salary_signatures";
+  if (salaryCount === 0 && signingCount > 0) return "signing_records";
+  if (salaryCount > 0 && signingCount > 0) return "conflict";
+  return "none";
+}
+
+function mapToSalaryStatus(payload: unknown): "signed" | "rejected" | null {
+  const mapped = mapToSigningStatus(payload);
+  if (mapped === "completed") return "signed";
+  if (mapped === "rejected") return "rejected";
+  return null;
+}
+
+async function updateSalaryStatusByContractNo(
+  admin: ReturnType<typeof createClient>,
+  contractNo: string,
+  nextStatus: "signed" | "rejected",
+) {
+  const now = new Date().toISOString();
+  const patch: Record<string, unknown> = { status: nextStatus, updated_at: now };
+  if (nextStatus === "signed") {
+    patch.signed_at = now;
+  }
+
+  const { error } = await admin
+    .from("salary_signatures")
+    .update(patch)
+    .eq("third_party_contract_no", contractNo)
+    .in("status", ["pending", "sent"]);
+  if (error) {
+    console.error(ROUTE_LOG, "更新 salary_signatures 状态失败:", error.message);
+    return;
+  }
+  console.log(ROUTE_LOG, "更新 salary_signatures 状态成功", { contractNo, nextStatus });
 }
 
 function collectUrlStrings(obj: unknown, out: Set<string>) {
@@ -346,49 +413,94 @@ serve(async (req) => {
   const admin = createClient(supabaseUrl, serviceKey, {
     auth: { autoRefreshToken: false, persistSession: false },
   });
+  const notifyTarget = await resolveNotifyTarget(admin, contractNo);
+  if (notifyTarget === "conflict") {
+    console.error(ROUTE_LOG, "合同号同时命中两张表，拒绝自动更新，请人工处理", { contractNo });
+    return textResponse("success", 200);
+  }
+  if (notifyTarget === "none") {
+    console.warn(ROUTE_LOG, "合同号未命中业务表，跳过更新", { contractNo });
+    return textResponse("success", 200);
+  }
 
   // 回调的主职责：更新签署状态
-  const nextStatus = mapToSigningStatus(payload);
-  if (nextStatus) {
-    await updateSigningStatusByContractNo(admin, contractNo, nextStatus);
+  if (notifyTarget === "signing_records") {
+    const nextStatus = mapToSigningStatus(payload);
+    if (nextStatus) {
+      await updateSigningStatusByContractNo(admin, contractNo, nextStatus);
+    } else {
+      console.log(LOG, "未识别到可映射的签署状态，contractNo=", contractNo);
+    }
   } else {
-    console.log(LOG, "未识别到可映射的签署状态，contractNo=", contractNo);
+    const nextSalaryStatus = mapToSalaryStatus(payload);
+    if (nextSalaryStatus) {
+      await updateSalaryStatusByContractNo(admin, contractNo, nextSalaryStatus);
+    } else {
+      console.log(ROUTE_LOG, "salary_signatures 未识别到可映射状态", { contractNo });
+    }
   }
 
   const pdfBytes = await tryGetPdfBytes(payload);
   if (pdfBytes) {
-    const result = await uploadPdfBytesAndAttachToSigningRecords(admin, pdfBytes, {
-      contractNo,
-      uploadedBy: null,
-      fileNamePrefix: "asign",
-    });
-
-    if (!result.ok) {
-      console.error(LOG, "落库失败", result.error);
+    if (notifyTarget === "signing_records") {
+      const result = await uploadPdfBytesAndAttachToSigningRecords(admin, pdfBytes, {
+        contractNo,
+        uploadedBy: null,
+        fileNamePrefix: "asign",
+      });
+      if (!result.ok) {
+        console.error(LOG, "落库失败", result.error);
+      } else {
+        console.log(LOG, "已保存签署文件", result.publicUrl, "更新记录数", result.updatedRecordCount);
+      }
     } else {
-      console.log(LOG, "已保存签署文件", result.publicUrl, "更新记录数", result.updatedRecordCount);
+      const persist = await uploadPdfBytesAndAttachToSalarySignatures(admin, pdfBytes, {
+        contractNo,
+        uploadedBy: null,
+        fileNamePrefix: "salary-asign",
+      });
+      if (!persist.ok) {
+        console.error(ROUTE_LOG, "转存 PDF 失败，salary 回写中断", persist.error);
+      } else {
+        console.log(ROUTE_LOG, "salary_signatures 已完成 PDF 转存", {
+          contractNo,
+          publicUrl: persist.publicUrl,
+          updatedRecordCount: persist.updatedRecordCount,
+        });
+      }
     }
     return textResponse("success", 200);
   }
 
   const fallbackUrl = pickBestExternalPdfUrl(payload);
   if (fallbackUrl) {
-    const extRes = await applyExternalSignedFileUrlToSigningRecords(
-      admin,
-      contractNo,
-      fallbackUrl,
-      null,
-    );
-    if (!extRes.ok) {
-      console.error(LOG, "外链落库失败", extRes.error);
-    } else {
-      console.log(
-        LOG,
-        "已写入外链（未转存 Storage）",
-        extRes.publicUrl,
-        "更新记录数",
-        extRes.updatedRecordCount,
+    if (notifyTarget === "signing_records") {
+      const extRes = await applyExternalSignedFileUrlToSigningRecords(
+        admin,
+        contractNo,
+        fallbackUrl,
+        null,
       );
+      if (!extRes.ok) {
+        console.error(LOG, "外链落库失败", extRes.error);
+      } else {
+        console.log(
+          LOG,
+          "已写入外链（未转存 Storage）",
+          extRes.publicUrl,
+          "更新记录数",
+          extRes.updatedRecordCount,
+        );
+      }
+    } else {
+      const extRes = await applyExternalSignedFileUrlToSalarySignatures(
+        admin,
+        contractNo,
+        fallbackUrl,
+      );
+      if (!extRes.ok) {
+        console.error(ROUTE_LOG, "salary_signatures 外链回写失败", extRes.error);
+      }
     }
     return textResponse("success", 200);
   }

@@ -50,11 +50,10 @@ import {
 } from '@/components/ui/pagination';
 import { CompanySelector } from '@/components/ui/company-selector';
 import { toast } from 'sonner';
-import { Send, Trash2, Search, FileText, Calendar, Download, Undo2 } from 'lucide-react';
+import { Send, Trash2, Search, FileText, Calendar, Download, Undo2, Eye, CloudDownload } from 'lucide-react';
 import { Skeleton } from '@/components/ui/skeleton';
 import {
   getSalarySignatures,
-  getAttendanceSignatures,
   deleteSalarySignature,
   deleteAttendanceSignature,
   updateSalarySignature,
@@ -63,9 +62,9 @@ import {
   getEmployees,
   getSalaryRecords,
   getSalaryItems,
-  getAttendanceRecords,
   createSalarySignaturesBatch,
   addAsignSignatory,
+  downloadAsignContractAndSyncArchive,
 } from '@/db/api';
 import { supabase } from '@/db/supabase';
 import { useAuth } from '@/contexts/AuthContext';
@@ -84,22 +83,21 @@ import {
   buildAsignStrangersForSalarySigning,
   invokeAsignTemplateCreateSigning,
 } from '@/utils/asignSalaryInvokeCreateSigning';
-import { SALARY_SIGNATURE_STATUS_LABELS, SALARY_SIGNATURE_TYPE_LABELS, ATTENDANCE_SIGNATURE_STATUS_LABELS } from '@/types/types';
+import {
+  extractAsignTemplateControlHints,
+  mergeTemplateDateSignKeysForAddSigner,
+  type AsignTemplateControlHints,
+} from '@/utils/extractAsignTemplateControlHints';
+import { SALARY_SIGNATURE_STATUS_LABELS, ATTENDANCE_SIGNATURE_STATUS_LABELS } from '@/types/types';
 import { exportToCSV, formatDateTime } from '@/utils/exportUtils';
 
-/** 文书模板名称 → 本地薪酬签署类型（与 salary_signatures.type 对应） */
+/** 统一薪酬签署流程：不再区分考勤/工资条，全部按薪酬签署处理。 */
 function inferSalarySignatureTypeFromTemplateName(name: string): SalarySignatureType | null {
   const n = (name || '').trim();
   if (!n) {
     return null;
   }
-  if (n.includes('考勤')) {
-    return 'attendance_record';
-  }
-  if (n.includes('工资') || n.includes('薪') || n.includes('绩效')) {
-    return 'salary_slip';
-  }
-  return null;
+  return 'salary_slip';
 }
 
 function employeeToAsignFill(employee: Employee): AsignContractFillEmployee {
@@ -203,9 +201,24 @@ function buildSalaryExtraFillData(data: Record<string, number | string> | undefi
   return out;
 }
 
+/**
+ * 薪酬模板常见仅有「个人」或「乙方」签署位（无甲方企业章场景居多），优先匹配「个人」（与常见工资条/确认书控件一致）。
+ */
+function pickSalaryPartyBMainSignKey(signKeys: string[]): string | null {
+  const set = new Set(signKeys.map((s) => s.trim()).filter(Boolean));
+  const order = ['个人', '乙方', '员工', '员工签字', '乙方签字'] as const;
+  for (const k of order) {
+    if (set.has(k)) {
+      return k;
+    }
+  }
+  return null;
+}
+
 export default function SalarySignaturesPage() {
   const { profile } = useAuth();
   const [signatures, setSignatures] = useState<SalarySignature[]>([]);
+  const [salaryStatusTab, setSalaryStatusTab] = useState<'unfinished' | 'finished'>('unfinished');
   const [attendanceSignatures, setAttendanceSignatures] = useState<AttendanceSignature[]>([]);
   const [companies, setCompanies] = useState<Company[]>([]);
   const [loading, setLoading] = useState(true);
@@ -217,6 +230,8 @@ export default function SalarySignaturesPage() {
   const [filterYearMonth, setFilterYearMonth] = useState<string>('');
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [signatureToDelete, setSignatureToDelete] = useState<SalarySignature | null>(null);
+  const [salaryDetailDialogOpen, setSalaryDetailDialogOpen] = useState(false);
+  const [selectedSalarySignature, setSelectedSalarySignature] = useState<SalarySignature | null>(null);
   // 批量选择相关状态
   const [selectedSalaryIds, setSelectedSalaryIds] = useState<string[]>([]);
   const [selectedAttendanceIds, setSelectedAttendanceIds] = useState<string[]>([]);
@@ -237,7 +252,6 @@ export default function SalarySignaturesPage() {
   const [isCreatingSalaryAsignPreview, setIsCreatingSalaryAsignPreview] = useState(false);
   const [batchSendProgress, setBatchSendProgress] = useState({ current: 0, total: 0 });
 
-  const [salaryAsignPreviewOpen, setSalaryAsignPreviewOpen] = useState(false);
   const [salaryPreviewFileUrl, setSalaryPreviewFileUrl] = useState('');
   const [salaryBatchPreviewItems, setSalaryBatchPreviewItems] = useState<
     Array<{ key: string; label: string; previewUrl: string }>
@@ -250,11 +264,14 @@ export default function SalarySignaturesPage() {
       employee: Employee;
       template: DocumentTemplate;
       contractNo: string;
+      asignRaw: unknown;
+      asignTemplateHints?: AsignTemplateControlHints;
       companyFill: AsignContractFillCompany;
       extraFillData?: Record<string, string>;
     }>
   >([]);
   const [launchingSalarySigning, setLaunchingSalarySigning] = useState(false);
+  const [syncingSalarySignatureId, setSyncingSalarySignatureId] = useState<string | null>(null);
 
   useEffect(() => {
     if (salaryBatchPreviewItems.length <= 1) {
@@ -302,13 +319,12 @@ export default function SalarySignaturesPage() {
 
   const loadData = async () => {
     setLoading(true);
-    const [signaturesData, attendanceData, companiesData] = await Promise.all([
+    const [signaturesData, companiesData] = await Promise.all([
       getSalarySignatures(),
-      getAttendanceSignatures(),
       getCompanies()
     ]);
     setSignatures(signaturesData);
-    setAttendanceSignatures(attendanceData);
+    setAttendanceSignatures([]);
     setCompanies(companiesData);
     setLoading(false);
   };
@@ -326,7 +342,7 @@ export default function SalarySignaturesPage() {
 
     const success = await updateSalarySignature(signature.id, {
       status: 'revoked',
-      sent_at: null
+      sent_at: undefined
     });
 
     if (success) {
@@ -354,6 +370,11 @@ export default function SalarySignaturesPage() {
     }
     setDeleteDialogOpen(false);
     setSignatureToDelete(null);
+  };
+
+  const handleOpenSalaryDetail = (signature: SalarySignature) => {
+    setSelectedSalarySignature(signature);
+    setSalaryDetailDialogOpen(true);
   };
 
   // 删除考勤签署记录
@@ -428,7 +449,7 @@ export default function SalarySignaturesPage() {
       if (signature && (signature.status === 'sent' || signature.status === 'pending')) {
         const success = await updateSalarySignature(id, {
           status: 'revoked',
-          sent_at: null
+          sent_at: undefined
         });
         if (success) {
           successCount++;
@@ -587,24 +608,22 @@ export default function SalarySignaturesPage() {
       const selectedRecords = signatures.filter(s => selectedSalaryIds.includes(s.id));
       
       const exportData = selectedRecords.map(signature => ({
-        employee_name: signature.employee_name || '',
-        company_name: signature.company_name || '',
-        type: SALARY_SIGNATURE_TYPE_LABELS[signature.type as SalarySignatureType] || signature.type,
-        year_month: signature.year_month || '',
+        employee_name: signature.employee?.name || '',
+        company_name: signature.company?.name || '',
+        year_month: `${signature.year}年${signature.month}月`,
         status: SALARY_SIGNATURE_STATUS_LABELS[signature.status] || signature.status,
-        sent_at: formatDateTime(signature.sent_at),
+        created_at: formatDateTime(signature.created_at),
         signed_at: formatDateTime(signature.signed_at),
-        employee_phone: signature.employee_phone || '',
-        department: signature.department || ''
+        employee_phone: signature.employee?.phone || '',
+        department: signature.employee?.department || ''
       }));
 
       const headers = [
         { key: 'employee_name' as const, label: '员工姓名' },
         { key: 'company_name' as const, label: '公司名称' },
-        { key: 'type' as const, label: '类型' },
         { key: 'year_month' as const, label: '年月' },
         { key: 'status' as const, label: '状态' },
-        { key: 'sent_at' as const, label: '发送时间' },
+        { key: 'created_at' as const, label: '创建时间' },
         { key: 'signed_at' as const, label: '签署时间' },
         { key: 'employee_phone' as const, label: '员工电话' },
         { key: 'department' as const, label: '部门' }
@@ -632,14 +651,14 @@ export default function SalarySignaturesPage() {
       const selectedRecords = attendanceSignatures.filter(a => selectedAttendanceIds.includes(a.id));
       
       const exportData = selectedRecords.map(signature => ({
-        employee_name: signature.employee_name || '',
-        company_name: signature.company_name || '',
-        year_month: signature.year_month || '',
+        employee_name: signature.employee?.name || '',
+        company_name: signature.company?.name || '',
+        year_month: `${signature.year}年${signature.month}月`,
         status: ATTENDANCE_SIGNATURE_STATUS_LABELS[signature.status] || signature.status,
-        sent_at: formatDateTime(signature.sent_at),
+        created_at: formatDateTime(signature.created_at),
         signed_at: formatDateTime(signature.signed_at),
-        employee_phone: signature.employee_phone || '',
-        department: signature.department || ''
+        employee_phone: signature.employee?.phone || '',
+        department: signature.employee?.department || ''
       }));
 
       const headers = [
@@ -647,7 +666,7 @@ export default function SalarySignaturesPage() {
         { key: 'company_name' as const, label: '公司名称' },
         { key: 'year_month' as const, label: '年月' },
         { key: 'status' as const, label: '状态' },
-        { key: 'sent_at' as const, label: '发送时间' },
+        { key: 'created_at' as const, label: '创建时间' },
         { key: 'signed_at' as const, label: '签署时间' },
         { key: 'employee_phone' as const, label: '员工电话' },
         { key: 'department' as const, label: '部门' }
@@ -671,7 +690,7 @@ export default function SalarySignaturesPage() {
    * 集成流程（爱签等）：发起签署、员工完成签署后，由电子签回调或同步更新
    * salary_signatures.signed_file_url，用户即可通过此功能下载/查看已签署文件。
    */
-  const handleDownloadSignedFile = (signature: SalarySignature) => {
+  const handleDownloadSignedFile = async (signature: SalarySignature) => {
     if (!signature.signed_file_url) {
       toast.error('签署文件不存在');
       return;
@@ -683,32 +702,108 @@ export default function SalarySignaturesPage() {
       return;
     }
     
-    // 打开新窗口查看/下载文件
+    // 强制下载：先拉取二进制，再用 blob URL 触发浏览器下载
     try {
-      window.open(signature.signed_file_url, '_blank');
-      toast.success('正在打开签署文件...');
+      const response = await fetch(signature.signed_file_url);
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const blob = await response.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = `薪资签署文件_${signature.id.slice(0, 8)}_${new Date().toLocaleDateString('zh-CN').replace(/\//g, '-')}.pdf`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(blobUrl);
+      toast.success('开始下载签署文件');
     } catch (error) {
-      console.error('打开文件失败:', error);
-      toast.error('打开文件失败，请检查文件URL是否有效');
+      console.error('下载文件失败:', error);
+      toast.error('下载文件失败，请检查文件URL是否有效');
+    }
+  };
+
+  /** 新标签页预览已签署文件（与「下载」区分） */
+  const handlePreviewSignedFile = (signature: SalarySignature) => {
+    if (!signature.signed_file_url) {
+      toast.error('签署文件不存在');
+      return;
+    }
+    if (signature.signed_file_url.includes('example.com')) {
+      toast.error('这是示例数据，真实文件URL需要在签署完成后由电子签系统返回');
+      return;
+    }
+    try {
+      window.open(signature.signed_file_url, '_blank', 'noopener,noreferrer');
+      toast.success('正在打开文件预览…');
+    } catch (error) {
+      console.error('预览文件失败:', error);
+      toast.error('预览文件失败');
+    }
+  };
+
+  const handleSyncSalarySignedFile = async (signature: SalarySignature) => {
+    const contractNo = String(signature.third_party_contract_no ?? '').trim();
+    if (!contractNo) {
+      toast.error('该记录无爱签合同号，无法从爱签同步');
+      return;
+    }
+    setSyncingSalarySignatureId(signature.id);
+    try {
+      const result = await downloadAsignContractAndSyncArchive({
+        contractNo,
+        force: 0,
+      });
+      if (!result.ok) {
+        let detailStr = '';
+        if (result.detail !== undefined) {
+          if (typeof result.detail === 'string') {
+            detailStr = result.detail.slice(0, 220);
+          } else {
+            detailStr = JSON.stringify(result.detail).slice(0, 220);
+          }
+        }
+        toast.error(result.error, detailStr ? { description: detailStr } : undefined);
+        return;
+      }
+      toast.success(`已从爱签同步 PDF，共更新 ${result.updatedRecordCount} 条记录`);
+      await loadData();
+      setSelectedSalarySignature((prev) => {
+        if (!prev || prev.id !== signature.id) {
+          return prev;
+        }
+        return {
+          ...prev,
+          signed_file_url: result.publicUrl,
+          status: 'signed',
+        };
+      });
+    } catch (error) {
+      console.error('[SALARY_SIGN_SYNC] 同步失败', error);
+      toast.error('同步失败');
+    } finally {
+      setSyncingSalarySignatureId(null);
     }
   };
 
   // 下载已签署的考勤文件
   const handleDownloadAttendanceFile = (signature: AttendanceSignature) => {
-    if (!signature.signed_file_url) {
+    const signedFileUrl = (signature as AttendanceSignature & { signed_file_url?: string }).signed_file_url;
+    if (!signedFileUrl) {
       toast.error('签署文件不存在');
       return;
     }
     
     // 检查URL是否为示例URL
-    if (signature.signed_file_url.includes('example.com')) {
+    if (signedFileUrl.includes('example.com')) {
       toast.error('这是示例数据，真实文件URL需要在签署完成后由电子签系统返回');
       return;
     }
     
     // 打开新窗口查看/下载文件
     try {
-      window.open(signature.signed_file_url, '_blank');
+      window.open(signedFileUrl, '_blank');
       toast.success('正在打开签署文件...');
     } catch (error) {
       console.error('打开文件失败:', error);
@@ -738,6 +833,12 @@ export default function SalarySignaturesPage() {
   const filteredSalarySignatures = selectedCompanyId === 'all' 
     ? signatures 
     : signatures.filter(r => r.company_id === selectedCompanyId);
+  const statusFilteredSalarySignatures = filteredSalarySignatures.filter((s) => {
+    if (salaryStatusTab === 'unfinished') {
+      return s.status === 'pending' || s.status === 'sent';
+    }
+    return s.status === 'signed' || s.status === 'rejected' || s.status === 'revoked';
+  });
 
   // 筛选考勤签署记录
   const filteredAttendanceSignatures = selectedCompanyId === 'all' 
@@ -764,10 +865,10 @@ export default function SalarySignaturesPage() {
   };
 
   // 分页数据计算
-  const salaryTotalPages = Math.ceil(filteredSalarySignatures.length / pageSize);
+  const salaryTotalPages = Math.ceil(statusFilteredSalarySignatures.length / pageSize);
   const salaryStartIndex = (salaryCurrentPage - 1) * pageSize;
   const salaryEndIndex = salaryStartIndex + pageSize;
-  const paginatedSalarySignatures = filteredSalarySignatures.slice(salaryStartIndex, salaryEndIndex);
+  const paginatedSalarySignatures = statusFilteredSalarySignatures.slice(salaryStartIndex, salaryEndIndex);
 
   const attendanceTotalPages = Math.ceil(filteredAttendanceSignatures.length / pageSize);
   const attendanceStartIndex = (attendanceCurrentPage - 1) * pageSize;
@@ -901,19 +1002,41 @@ export default function SalarySignaturesPage() {
     }
 
     const [year, month] = batchSendYearMonth.split('-').map(Number);
-    const monthText = `${year}-${String(month).padStart(2, '0')}`;
-
-    const allowedTypes = new Set<SalarySignatureType>();
-    for (const tid of batchSendTemplateIds) {
-      const st = typeByTemplate.get(tid);
-      if (st) {
-        allowedTypes.add(st);
-      }
-    }
-
     const employees = batchSendEmployees;
     const empById = new Map(employees.map((e) => [e.id, e]));
     const selectedEmployeeIdSet = new Set(batchSendEmployeeIds);
+    const existingMonthRecords = signatures.filter((sig) => {
+      if (sig.company_id !== batchSendCompany) {
+        return false;
+      }
+      if (sig.year !== year || sig.month !== month) {
+        return false;
+      }
+      return selectedEmployeeIdSet.has(sig.employee_id);
+    });
+    if (existingMonthRecords.length > 0) {
+      const existedEmployeeNames = Array.from(
+        new Set(
+          existingMonthRecords.map((sig) => {
+            const localEmployee = empById.get(sig.employee_id);
+            if (localEmployee && localEmployee.name) {
+              return localEmployee.name;
+            }
+            if (sig.employee && sig.employee.name) {
+              return sig.employee.name;
+            }
+            return sig.employee_id;
+          }),
+        ),
+      );
+      const previewNames = existedEmployeeNames.slice(0, 8).join('、');
+      const moreCount = existedEmployeeNames.length - 8;
+      const tailText = moreCount > 0 ? ` 等${moreCount}人` : '';
+      toast.error(
+        `${year}年${month}月已存在薪酬签署记录：${previewNames}${tailText}。请先处理已有记录后再创建。`,
+      );
+      return;
+    }
     const sourceUnits: Array<{
       employee_id: string;
       type: SalarySignatureType;
@@ -922,50 +1045,29 @@ export default function SalarySignaturesPage() {
     }> = [];
     const sourceKeySet = new Set<string>();
 
-    if (allowedTypes.has('salary_slip')) {
-      const salaryRecords = await getSalaryRecords(batchSendCompany, year, month);
-      for (const record of salaryRecords) {
-        const items = await getSalaryItems(record.id);
-        for (const item of items) {
-          if (!selectedEmployeeIdSet.has(item.employee_id)) {
-            continue;
-          }
-          const key = `${item.employee_id}_salary_slip`;
-          if (sourceKeySet.has(key)) {
-            continue;
-          }
-          sourceUnits.push({
-            employee_id: item.employee_id,
-            type: 'salary_slip',
-            reference_id: record.id,
-            salaryData: item.data,
-          });
-          sourceKeySet.add(key);
-        }
-      }
-    }
-
-    if (allowedTypes.has('attendance_record')) {
-      const attendanceRecords = await getAttendanceRecords(batchSendCompany, monthText);
-      for (const attendance of attendanceRecords) {
-        if (!selectedEmployeeIdSet.has(attendance.employee_id)) {
+    const salaryRecords = await getSalaryRecords(batchSendCompany, year, month);
+    for (const record of salaryRecords) {
+      const items = await getSalaryItems(record.id);
+      for (const item of items) {
+        if (!selectedEmployeeIdSet.has(item.employee_id)) {
           continue;
         }
-        const key = `${attendance.employee_id}_attendance_record`;
+        const key = `${item.employee_id}_salary_slip`;
         if (sourceKeySet.has(key)) {
           continue;
         }
         sourceUnits.push({
-          employee_id: attendance.employee_id,
-          type: 'attendance_record',
-          reference_id: attendance.id,
+          employee_id: item.employee_id,
+          type: 'salary_slip',
+          reference_id: record.id,
+          salaryData: item.data,
         });
         sourceKeySet.add(key);
       }
     }
 
     if (sourceUnits.length === 0) {
-      toast.error('未找到可用于创建待签文件的数据源（工资条/考勤）');
+      toast.error('未找到可用于创建待签文件的数据源（薪酬数据）');
       return;
     }
 
@@ -1037,6 +1139,8 @@ export default function SalarySignaturesPage() {
         employee: Employee;
         template: DocumentTemplate;
         contractNo: string;
+        asignRaw: unknown;
+        asignTemplateHints?: AsignTemplateControlHints;
         companyFill: AsignContractFillCompany;
         extraFillData?: Record<string, string>;
       }> = [];
@@ -1096,14 +1200,19 @@ export default function SalarySignaturesPage() {
             company_id: batchSendCompany,
             employee_id: unit.source.employee_id,
             type: unit.source.type,
+            document_template_id: unit.template.id,
+            document_name: unit.template.name,
             reference_id: unit.source.reference_id,
             year,
             month,
             status: 'pending',
+            third_party_contract_no: result.effectiveContractNo,
           },
           employee: emp,
           template: unit.template,
           contractNo: result.effectiveContractNo,
+          asignRaw: result.asign,
+          asignTemplateHints: result.asignTemplateHints,
           companyFill,
           extraFillData: buildSalaryExtraFillData(unit.source.salaryData),
         });
@@ -1114,8 +1223,6 @@ export default function SalarySignaturesPage() {
       setSalaryBatchPreviewItems(previewItems);
       const firstUrl = previewItems[0]?.previewUrl || '';
       setSalaryPreviewFileUrl(firstUrl);
-      setBatchSendDialogOpen(false);
-      setSalaryAsignPreviewOpen(true);
       toast.success('已创建待签文件，请预览后点击「立即发起」。');
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1127,6 +1234,47 @@ export default function SalarySignaturesPage() {
 
   /** 第二步：添加签署人并创建签署记录 */
   const handleLaunchSalarySigning = async () => {
+    const getAsignCreateContractAttachNo = (asignRoot: unknown): number => {
+      const parseFirstAttachNo = (files: unknown): number | null => {
+        if (!Array.isArray(files) || files.length === 0) {
+          return null;
+        }
+        const first = files[0] as Record<string, unknown>;
+        const n = first?.attachNo ?? first?.attachmentNo;
+        if (typeof n === 'number' && Number.isFinite(n) && n > 0) {
+          return n;
+        }
+        const parsed = parseInt(String(n ?? ''), 10);
+        if (Number.isFinite(parsed) && parsed > 0) {
+          return parsed;
+        }
+        return null;
+      };
+      const tryNode = (node: unknown, depth: number): number | null => {
+        if (depth > 10 || node === null || typeof node !== 'object') {
+          return null;
+        }
+        const o = node as Record<string, unknown>;
+        const direct = parseFirstAttachNo(o.contractFiles);
+        if (direct !== null) {
+          return direct;
+        }
+        const drillKeys = ['data', 'asign', 'result'] as const;
+        for (const k of drillKeys) {
+          const child = o[k];
+          if (child === undefined || child === null) {
+            continue;
+          }
+          const got = tryNode(child, depth + 1);
+          if (got !== null) {
+            return got;
+          }
+        }
+        return null;
+      };
+      return tryNode(asignRoot, 0) ?? 1;
+    };
+
     if (salaryLaunchDrafts.length === 0) {
       toast.error('没有可发起的待签文件，请先创建预览');
       return;
@@ -1140,6 +1288,7 @@ export default function SalarySignaturesPage() {
           .map((sig) => `${sig.employee_id}_${sig.type}_${sig.reference_id}`),
       );
       const signaturePayloads: Omit<SalarySignature, 'id' | 'created_at' | 'updated_at'>[] = [];
+      let signerAddedCount = 0;
 
       let step = 0;
       for (const draft of salaryLaunchDrafts) {
@@ -1150,13 +1299,81 @@ export default function SalarySignaturesPage() {
           fillEmp,
           draft.template.requires_company_signature ? draft.companyFill : undefined,
         );
-        const signers = strangers.map((s, index) => ({
-          account: s.account,
-          noticeMobile: s.mobile,
-          signType: 3,
-          isNotice: 1,
-          signOrder: String(index + 1),
-        }));
+        const attachNo = getAsignCreateContractAttachNo(draft.asignRaw);
+        const hintsFromTemplate = draft.asignTemplateHints;
+        const hintsFromCreate = extractAsignTemplateControlHints(draft.asignRaw);
+        let hints: AsignTemplateControlHints;
+        if (hintsFromTemplate && hintsFromTemplate.signKeys.length > 0) {
+          hints = hintsFromTemplate;
+        } else {
+          hints = hintsFromCreate;
+        }
+        const signKeysArr = hints.signKeys.map((s) => s.trim()).filter(Boolean);
+        const signKeySet = new Set(signKeysArr);
+
+        let mainBSignKey = pickSalaryPartyBMainSignKey(signKeysArr);
+        let useTemplateSignKeysForEmployee = signKeysArr.length > 0 && Boolean(mainBSignKey);
+
+        if (!mainBSignKey) {
+          const envMain = String(import.meta.env.VITE_ASIGN_SALARY_MAIN_SIGN_KEY ?? '').trim();
+          if (envMain === '乙方' || envMain === '个人') {
+            mainBSignKey = envMain;
+            useTemplateSignKeysForEmployee = false;
+          } else if (signKeysArr.length === 0) {
+            mainBSignKey = '个人';
+            useTemplateSignKeysForEmployee = false;
+          } else {
+            throw new Error(
+              `爱签模板中未找到薪酬常用签署位（乙方/个人）。请在爱签控制台核对签署位 dataKey，或在前端环境变量 VITE_ASIGN_SALARY_MAIN_SIGN_KEY 中指定「乙方」或「个人」。当前解析到的签署位：${signKeysArr.join('、') || '（无）'}`,
+            );
+          }
+        }
+
+        let employeeSignStrategyList: Array<{
+          attachNo: number;
+          locationMode: number;
+          signType: number;
+          signKey: string;
+        }>;
+        if (useTemplateSignKeysForEmployee) {
+          const dateSignKeys = mergeTemplateDateSignKeysForAddSigner({
+            signKeys: signKeysArr,
+            mainPartyBSignKey: mainBSignKey,
+            timestampSignKeys: hints.timestampSignKeys,
+          });
+          employeeSignStrategyList = [
+            { attachNo, locationMode: 4, signType: 1, signKey: mainBSignKey },
+            ...dateSignKeys.map((key) => ({
+              attachNo,
+              locationMode: 4,
+              signType: 2,
+              signKey: key,
+            })),
+          ];
+        } else {
+          employeeSignStrategyList = [
+            { attachNo, locationMode: 4, signType: 1, signKey: mainBSignKey },
+          ];
+        }
+
+        const companySignStrategyList = [{ attachNo, locationMode: 4, signType: 1, signKey: '甲方' }];
+
+        const signers = strangers.map((s, index) => {
+          const isCompanySigner = s.userType === 1;
+          if (isCompanySigner && draft.template.requires_company_signature && !signKeySet.has('甲方')) {
+            throw new Error(
+              `所选文书需要企业盖章，但爱签模板中未找到「甲方」签署位。模板签署位：${hints.signKeys.join('、')}`,
+            );
+          }
+          return {
+            account: s.account,
+            noticeMobile: s.mobile,
+            signType: 3,
+            isNotice: 1,
+            signOrder: String(index + 1),
+            signStrategyList: isCompanySigner ? companySignStrategyList : employeeSignStrategyList,
+          };
+        });
         const addRes = await addAsignSignatory({
           contractNo: draft.contractNo,
           signers,
@@ -1164,6 +1381,7 @@ export default function SalarySignaturesPage() {
         if (!addRes.success) {
           throw new Error(addRes.error || `合同 ${draft.contractNo} 添加签署方失败`);
         }
+        signerAddedCount += 1;
 
         const k = `${draft.signaturePayload.employee_id}_${draft.signaturePayload.type}_${draft.signaturePayload.reference_id}`;
         if (!payloadKeySet.has(k)) {
@@ -1178,13 +1396,17 @@ export default function SalarySignaturesPage() {
           throw new Error('创建签署记录失败');
         }
       }
+      const createdCount = signaturePayloads.length;
+      const skippedCount = Math.max(0, salaryLaunchDrafts.length - createdCount);
 
       await loadData();
-      setSalaryAsignPreviewOpen(false);
+      setBatchSendDialogOpen(false);
       setSalaryBatchPreviewItems([]);
       setSalaryPreviewFileUrl('');
       setSalaryLaunchDrafts([]);
-      toast.success(`发起成功，已处理 ${salaryLaunchDrafts.length} 份合同`);
+      toast.success(
+        `发起成功：已添加签署人 ${signerAddedCount} 份，新增签署记录 ${createdCount} 条，跳过已存在 ${skippedCount} 条`,
+      );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       toast.error('立即发起失败', { description: msg, duration: 6000 });
@@ -1265,13 +1487,23 @@ export default function SalarySignaturesPage() {
                 <Skeleton className="h-64 w-full bg-muted" />
               </div>
             ) : (
-              <Tabs defaultValue="salary" className="w-full">
+              <Tabs
+                value={salaryStatusTab}
+                onValueChange={(value) => {
+                  if (value === 'unfinished' || value === 'finished') {
+                    setSalaryStatusTab(value);
+                    setSalaryCurrentPage(1);
+                    setSelectedSalaryIds([]);
+                  }
+                }}
+                className="w-full"
+              >
                 <TabsList className="inline-flex w-auto flex-nowrap">
-                  <TabsTrigger value="salary" className="whitespace-nowrap">工资条签署</TabsTrigger>
-                  <TabsTrigger value="attendance" className="whitespace-nowrap">考勤确认签署</TabsTrigger>
+                  <TabsTrigger value="unfinished" className="whitespace-nowrap">未完成</TabsTrigger>
+                  <TabsTrigger value="finished" className="whitespace-nowrap">已完成</TabsTrigger>
                 </TabsList>
 
-                <TabsContent value="salary" className="space-y-4">
+                <div className="space-y-4">
                   {/* 批量操作按钮 */}
                   <div className="flex gap-2">
                     <Button
@@ -1283,7 +1515,7 @@ export default function SalarySignaturesPage() {
                       <Undo2 className="h-4 w-4 mr-1" />
                       批量撤回 {selectedSalaryIds.length > 0 && `(${selectedSalaryIds.length})`}
                     </Button>
-                    <Button
+                    {/* <Button
                       variant="destructive"
                       size="sm"
                       onClick={handleBatchDeleteSalary}
@@ -1291,8 +1523,8 @@ export default function SalarySignaturesPage() {
                     >
                       <Trash2 className="h-4 w-4 mr-1" />
                       批量删除 {selectedSalaryIds.length > 0 && `(${selectedSalaryIds.length})`}
-                    </Button>
-                    <Button
+                    </Button> */}
+                    {/* <Button
                       variant="outline"
                       size="sm"
                       onClick={handleBatchDownloadSalary}
@@ -1300,11 +1532,11 @@ export default function SalarySignaturesPage() {
                     >
                       <Download className="h-4 w-4 mr-1" />
                       批量下载 {selectedSalaryIds.length > 0 && `(${selectedSalaryIds.length})`}
-                    </Button>
+                    </Button> */}
                   </div>
 
                   {/* 统计卡片 */}
-                  <div className="grid grid-cols-2 md:grid-cols-6 gap-4">
+                  {/* <div className="grid grid-cols-2 md:grid-cols-6 gap-4">
                     <Card>
                       <CardHeader className="pb-2">
                         <CardTitle className="text-sm font-medium text-muted-foreground">
@@ -1365,7 +1597,7 @@ export default function SalarySignaturesPage() {
                         <div className="text-2xl font-bold text-gray-600">{salaryStats.revoked}</div>
                       </CardContent>
                     </Card>
-                  </div>
+                  </div> */}
 
                   {/* 签署记录列表 */}
                   <div className="rounded-md border overflow-x-auto">
@@ -1383,10 +1615,9 @@ export default function SalarySignaturesPage() {
                           </TableHead>
                           <TableHead className="whitespace-nowrap">公司名称</TableHead>
                           <TableHead className="whitespace-nowrap">员工姓名</TableHead>
-                          <TableHead className="whitespace-nowrap">类型</TableHead>
                           <TableHead className="whitespace-nowrap">年月</TableHead>
                           <TableHead className="whitespace-nowrap">状态</TableHead>
-                          <TableHead className="whitespace-nowrap">发送时间</TableHead>
+                          <TableHead className="whitespace-nowrap">创建时间</TableHead>
                           <TableHead className="text-right whitespace-nowrap">操作</TableHead>
                         </TableRow>
                       </TableHeader>
@@ -1413,11 +1644,6 @@ export default function SalarySignaturesPage() {
                                 {signature.employee?.name || '-'}
                               </TableCell>
                               <TableCell className="whitespace-nowrap">
-                                <Badge variant="outline">
-                                  {SALARY_SIGNATURE_TYPE_LABELS[signature.type]}
-                                </Badge>
-                              </TableCell>
-                              <TableCell className="whitespace-nowrap">
                                 {signature.year}年{signature.month}月
                               </TableCell>
                               <TableCell className="whitespace-nowrap">
@@ -1426,8 +1652,8 @@ export default function SalarySignaturesPage() {
                                 </Badge>
                               </TableCell>
                               <TableCell className="whitespace-nowrap">
-                                {signature.sent_at
-                                  ? new Date(signature.sent_at).toLocaleString('zh-CN')
+                                {signature.created_at
+                                  ? new Date(signature.created_at).toLocaleString('zh-CN')
                                   : '-'}
                               </TableCell>
                               <TableCell className="text-right whitespace-nowrap">
@@ -1451,23 +1677,35 @@ export default function SalarySignaturesPage() {
                                     </Button>
                                   )}
                                   {signature.status === 'signed' && (
-                                    <Button
-                                      variant="default"
-                                      size="sm"
-                                      onClick={() => handleDownloadSignedFile(signature)}
-                                    >
-                                      <Download className="h-4 w-4 mr-1" />
-                                      查看文件
-                                    </Button>
+                                    <>
+                                      <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        onClick={() => handleOpenSalaryDetail(signature)}
+                                        title="查看详情"
+                                      >
+                                        <Eye className="h-4 w-4" />
+                                      </Button>
+                                      {signature.signed_file_url && (
+                                        <Button
+                                          variant="ghost"
+                                          size="sm"
+                                          onClick={() => handleDownloadSignedFile(signature)}
+                                          title="下载文件"
+                                        >
+                                          <Download className="h-4 w-4" />
+                                        </Button>
+                                      )}
+                                    </>
                                   )}
-                                  <Button
+                                  {/* <Button
                                     variant="ghost"
                                     size="sm"
                                     onClick={() => handleDeleteClick(signature)}
                                   >
                                     <Trash2 className="h-4 w-4 mr-1" />
                                     删除
-                                  </Button>
+                                  </Button> */}
                                 </div>
                               </TableCell>
                             </TableRow>
@@ -1481,7 +1719,7 @@ export default function SalarySignaturesPage() {
                   {salaryTotalPages > 1 && (
                     <div className="flex items-center justify-between">
                       <div className="text-sm text-muted-foreground">
-                        共 {filteredSalarySignatures.length} 条记录，第 {salaryCurrentPage} / {salaryTotalPages} 页
+                        共 {statusFilteredSalarySignatures.length} 条记录，第 {salaryCurrentPage} / {salaryTotalPages} 页
                       </div>
                       <Pagination>
                         <PaginationContent>
@@ -1538,7 +1776,7 @@ export default function SalarySignaturesPage() {
                       </Pagination>
                     </div>
                   )}
-                </TabsContent>
+                </div>
 
                 <TabsContent value="attendance" className="space-y-4">
                   {/* 批量操作按钮 */}
@@ -1552,7 +1790,7 @@ export default function SalarySignaturesPage() {
                       <Undo2 className="h-4 w-4 mr-1" />
                       批量撤回 {selectedAttendanceIds.length > 0 && `(${selectedAttendanceIds.length})`}
                     </Button>
-                    <Button
+                    {/* <Button
                       variant="destructive"
                       size="sm"
                       onClick={handleBatchDeleteAttendance}
@@ -1560,8 +1798,8 @@ export default function SalarySignaturesPage() {
                     >
                       <Trash2 className="h-4 w-4 mr-1" />
                       批量删除 {selectedAttendanceIds.length > 0 && `(${selectedAttendanceIds.length})`}
-                    </Button>
-                    <Button
+                    </Button> */}
+                    {/* <Button
                       variant="outline"
                       size="sm"
                       onClick={handleBatchDownloadAttendance}
@@ -1569,11 +1807,11 @@ export default function SalarySignaturesPage() {
                     >
                       <Download className="h-4 w-4 mr-1" />
                       批量下载 {selectedAttendanceIds.length > 0 && `(${selectedAttendanceIds.length})`}
-                    </Button>
+                    </Button> */}
                   </div>
 
                   {/* 统计卡片 */}
-                  <div className="grid grid-cols-2 md:grid-cols-6 gap-4">
+                  {/* <div className="grid grid-cols-2 md:grid-cols-6 gap-4">
                     <Card>
                       <CardHeader className="pb-2">
                         <CardTitle className="text-sm font-medium text-muted-foreground">
@@ -1634,7 +1872,7 @@ export default function SalarySignaturesPage() {
                         <div className="text-2xl font-bold text-gray-600">{attendanceStats.revoked}</div>
                       </CardContent>
                     </Card>
-                  </div>
+                  </div> */}
 
                   {/* 签署记录列表 */}
                   <div className="rounded-md border overflow-x-auto">
@@ -1654,7 +1892,7 @@ export default function SalarySignaturesPage() {
                           <TableHead className="whitespace-nowrap">员工姓名</TableHead>
                           <TableHead className="whitespace-nowrap">年月</TableHead>
                           <TableHead className="whitespace-nowrap">状态</TableHead>
-                          <TableHead className="whitespace-nowrap">发送时间</TableHead>
+                          <TableHead className="whitespace-nowrap">创建时间</TableHead>
                           <TableHead className="text-right whitespace-nowrap">操作</TableHead>
                         </TableRow>
                       </TableHeader>
@@ -1689,8 +1927,8 @@ export default function SalarySignaturesPage() {
                                 </Badge>
                               </TableCell>
                               <TableCell className="whitespace-nowrap">
-                                {signature.sent_at
-                                  ? new Date(signature.sent_at).toLocaleString('zh-CN')
+                                {signature.created_at
+                                  ? new Date(signature.created_at).toLocaleString('zh-CN')
                                   : '-'}
                               </TableCell>
                               <TableCell className="text-right whitespace-nowrap">
@@ -1810,6 +2048,95 @@ export default function SalarySignaturesPage() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      <Dialog
+        open={salaryDetailDialogOpen}
+        onOpenChange={(open) => {
+          if (!open && syncingSalarySignatureId) {
+            toast.error('正在同步，请稍候…');
+            return;
+          }
+          setSalaryDetailDialogOpen(open);
+          if (!open) {
+            setSelectedSalarySignature(null);
+          }
+        }}
+      >
+        <DialogContent className="max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>签署详情</DialogTitle>
+          </DialogHeader>
+          {selectedSalarySignature && (
+            <div className="space-y-4">
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <Label className="text-muted-foreground">员工</Label>
+                  <p className="font-medium">{selectedSalarySignature.employee?.name || '-'}</p>
+                </div>
+                <div>
+                  <Label className="text-muted-foreground">公司</Label>
+                  <p className="font-medium">{selectedSalarySignature.company?.name || '-'}</p>
+                </div>
+                <div>
+                  <Label className="text-muted-foreground">状态</Label>
+                  <p className="mt-1">
+                    <Badge variant={getStatusBadgeVariant(selectedSalarySignature.status)}>
+                      {SALARY_SIGNATURE_STATUS_LABELS[selectedSalarySignature.status]}
+                    </Badge>
+                  </p>
+                </div>
+                <div>
+                  <Label className="text-muted-foreground">创建时间</Label>
+                  <p className="font-medium">
+                    {selectedSalarySignature.created_at
+                      ? new Date(selectedSalarySignature.created_at).toLocaleString('zh-CN')
+                      : '-'}
+                  </p>
+                </div>
+                <div>
+                  <Label className="text-muted-foreground">年月</Label>
+                  <p className="font-medium">{selectedSalarySignature.year}年{selectedSalarySignature.month}月</p>
+                </div>
+              </div>
+              {selectedSalarySignature.third_party_contract_no && (
+                <div className="border-t pt-4 space-y-2">
+                  <Label className="text-muted-foreground">爱签档案同步</Label>
+                  <div className="flex flex-wrap gap-2 items-center">
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="sm"
+                      disabled={syncingSalarySignatureId === selectedSalarySignature.id}
+                      onClick={() => handleSyncSalarySignedFile(selectedSalarySignature)}
+                    >
+                      <CloudDownload className="h-4 w-4 mr-1" />
+                      {syncingSalarySignatureId === selectedSalarySignature.id ? '同步中…' : '从爱签同步 PDF'}
+                    </Button>
+                    <span className="text-xs text-muted-foreground font-mono break-all">
+                      {selectedSalarySignature.third_party_contract_no}
+                    </span>
+                  </div>
+                </div>
+              )}
+              {selectedSalarySignature.signed_file_url && (
+                <div className="border-t pt-4">
+                  <Label className="text-muted-foreground">签署文件</Label>
+                  <div className="mt-2 flex gap-2">
+                    <Button type="button" variant="outline" onClick={() => handlePreviewSignedFile(selectedSalarySignature)}>
+                      <Eye className="h-4 w-4 mr-1" />
+                      查看文件
+                    </Button>
+                    <Button type="button" onClick={() => handleDownloadSignedFile(selectedSalarySignature)}>
+                      <Download className="h-4 w-4 mr-1" />
+                      下载文件
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
 
       {/* 批量发起：爱签 create-signing 预览 */}
       <Dialog open={batchSendDialogOpen} onOpenChange={handleBatchSendDialogOpenChange}>
@@ -1938,6 +2265,59 @@ export default function SalarySignaturesPage() {
               )}
             </div>
 
+            {salaryLaunchDrafts.length > 0 && (
+              <div className="space-y-3 rounded-md border p-3">
+                <div className="flex items-center justify-between">
+                  <Label>待签文件预览</Label>
+                  <div className="text-xs text-muted-foreground">
+                    已生成 {salaryLaunchDrafts.length} 份
+                  </div>
+                </div>
+                {salaryBatchPreviewItems.length > 1 && (
+                  <div className="flex flex-wrap gap-2">
+                    {salaryBatchPreviewItems.map((item) => {
+                      const activeKey =
+                        salarySelectedBatchPreviewKey ?? salaryBatchPreviewItems[0]?.key ?? '';
+                      const isActive = item.key === activeKey;
+                      return (
+                        <Button
+                          key={item.key}
+                          type="button"
+                          size="sm"
+                          variant={isActive ? 'default' : 'outline'}
+                          onClick={() => {
+                            setSalarySelectedBatchPreviewKey(item.key);
+                            setSalaryPreviewFileUrl(item.previewUrl);
+                          }}
+                          disabled={launchingSalarySigning}
+                        >
+                          {item.label}
+                        </Button>
+                      );
+                    })}
+                  </div>
+                )}
+                <div className="h-[420px] overflow-hidden rounded-md border">
+                  {salaryPreviewFileUrl ? (
+                    <iframe
+                      key={
+                        salaryBatchPreviewItems.length > 1
+                          ? `${salarySelectedBatchPreviewKey ?? salaryBatchPreviewItems[0]?.key ?? 'batch'}:${salaryPreviewFileUrl}`
+                          : salaryPreviewFileUrl
+                      }
+                      src={salaryPreviewFileUrl}
+                      className="h-full w-full border-0"
+                      title="爱签预览"
+                    />
+                  ) : (
+                    <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                      无预览地址
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
             {isCreatingSalaryAsignPreview && batchSendProgress.total > 0 && (
               <div className="space-y-2">
                 <div className="flex justify-between text-sm">
@@ -1956,115 +2336,30 @@ export default function SalarySignaturesPage() {
             )}
           </div>
           <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={tryCloseBatchSendDialog}
-              disabled={isCreatingSalaryAsignPreview}
-            >
-              取消
-            </Button>
-            <Button
-              onClick={handleBatchSendConfirm}
-              disabled={isCreatingSalaryAsignPreview}
-            >
-              {isCreatingSalaryAsignPreview ? '创建预览中…' : '发起签署'}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog
-        open={salaryAsignPreviewOpen}
-        onOpenChange={(open) => {
-          if (!open) {
-            if (launchingSalarySigning) {
-              toast.error('正在发起签署，请稍候…');
-              return;
-            }
-            setSalaryAsignPreviewOpen(false);
-            setSalaryBatchPreviewItems([]);
-            setSalaryPreviewFileUrl('');
-            setSalaryLaunchDrafts([]);
-          }
-        }}
-      >
-        <DialogContent className="max-w-4xl h-[80vh]">
-          <DialogHeader>
-            <DialogTitle>爱签待签署文件预览</DialogTitle>
-            <DialogDescription>请核对爱签生成的待签文件内容。</DialogDescription>
-          </DialogHeader>
-          <div className="flex flex-1 flex-col gap-3 overflow-hidden">
-            {salaryBatchPreviewItems.length > 1 && (
-              <div className="flex flex-wrap gap-2">
-                {salaryBatchPreviewItems.map((item) => {
-                  const activeKey =
-                    salarySelectedBatchPreviewKey ?? salaryBatchPreviewItems[0]?.key ?? '';
-                  const isActive = item.key === activeKey;
-                  return (
-                    <Button
-                      key={item.key}
-                      type="button"
-                      size="sm"
-                      variant={isActive ? 'default' : 'outline'}
-                      onClick={() => {
-                        setSalarySelectedBatchPreviewKey(item.key);
-                        setSalaryPreviewFileUrl(item.previewUrl);
-                      }}
-                    >
-                      {item.label}
-                    </Button>
-                  );
-                })}
-              </div>
+            {salaryLaunchDrafts.length > 0 ? (
+              <Button
+                onClick={handleLaunchSalarySigning}
+                disabled={launchingSalarySigning}
+              >
+                {launchingSalarySigning ? '发起中…' : '立即发起'}
+              </Button>
+            ) : (
+              <>
+                <Button
+                  variant="outline"
+                  onClick={tryCloseBatchSendDialog}
+                  disabled={isCreatingSalaryAsignPreview}
+                >
+                  取消
+                </Button>
+                <Button
+                  onClick={handleBatchSendConfirm}
+                  disabled={isCreatingSalaryAsignPreview || launchingSalarySigning}
+                >
+                  {isCreatingSalaryAsignPreview ? '创建预览中…' : '生成待签预览'}
+                </Button>
+              </>
             )}
-            <div className="min-h-0 flex-1 overflow-hidden rounded-md border">
-              {salaryPreviewFileUrl ? (
-                <iframe
-                  key={
-                    salaryBatchPreviewItems.length > 1
-                      ? `${salarySelectedBatchPreviewKey ?? salaryBatchPreviewItems[0]?.key ?? 'batch'}:${salaryPreviewFileUrl}`
-                      : salaryPreviewFileUrl
-                  }
-                  src={salaryPreviewFileUrl}
-                  className="h-[calc(80vh-200px)] w-full border-0"
-                  title="爱签预览"
-                />
-              ) : (
-                <div className="flex h-[calc(80vh-200px)] items-center justify-center text-sm text-muted-foreground">
-                  无预览地址
-                </div>
-              )}
-            </div>
-          </div>
-          <DialogFooter className="gap-2 sm:justify-between">
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => window.open(salaryPreviewFileUrl, '_blank')}
-              disabled={!salaryPreviewFileUrl}
-            >
-              在新标签页打开
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => {
-                setSalaryAsignPreviewOpen(false);
-                setSalaryBatchPreviewItems([]);
-                setSalaryPreviewFileUrl('');
-                setSalaryLaunchDrafts([]);
-              }}
-              disabled={launchingSalarySigning}
-            >
-              关闭
-            </Button>
-            <Button
-              type="button"
-              onClick={handleLaunchSalarySigning}
-              disabled={launchingSalarySigning || salaryLaunchDrafts.length === 0}
-            >
-              {launchingSalarySigning ? '发起中…' : '立即发起'}
-            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

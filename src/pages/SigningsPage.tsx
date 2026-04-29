@@ -64,8 +64,10 @@ import {
   uploadSignedDocument,
   updateSigningRecordFile,
   downloadAsignContractAndSyncArchive,
+  withdrawAsignContract,
   addAsignSignatory,
   getAsignTemplateList,
+  getAsignTemplateData,
   type AsignAddSignerItem,
   type AsignSignStrategyItem,
 } from '@/db/api';
@@ -80,6 +82,7 @@ import { supabase } from '@/db/supabase';
 import { htmlStringToPdfBlob } from '@/utils/htmlToPdf';
 import { buildAsignFillDataForContract } from '@/utils/asignFillData';
 import {
+  extractAsignTemplateControlHints,
   mergeTemplateDateSignKeysForAddSigner,
   pickAsignPartyBMainSignKey,
   type AsignTemplateControlHints,
@@ -2830,13 +2833,14 @@ export default function SigningsPage() {
       ];
       /**
        * 爱签 addSigner 会校验 signKey 必须在模板中存在；多传不存在的 key 会报 100617。
-       * 非「爱签模板 + getTemplateData」路径：沿用环境变量；未配置时默认「当前日期」以兼容历史 PDF 流程。
+       * 非「爱签模板 + getTemplateData」路径：沿用环境变量；未配置时不再默认注入「当前日期」，
+       * 避免模板未配置该签署位时触发 100617。
        */
       const dateSignKeysEnvRaw = import.meta.env.VITE_ASIGN_DATE_SIGN_KEYS;
       const dateSignKeys = Array.from(
         new Set(
           dateSignKeysEnvRaw === undefined
-            ? ['当前日期']
+            ? []
             : String(dateSignKeysEnvRaw)
                 .split(',')
                 .map((s) => s.trim())
@@ -3222,12 +3226,34 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
 
     const effectiveContractNo = extractContractNoFromCreateSigningResponse(data, contractNo);
 
+    let asignTemplateHints: AsignTemplateControlHints | undefined;
+    if (allAsignTemplateMode) {
+      let docTemplateForHints: DocumentTemplate | null = null;
+      if (opts?.asignRound?.docTemplate) {
+        docTemplateForHints = opts.asignRound.docTemplate;
+      } else if (selectedForAsign.length === 1) {
+        docTemplateForHints = selectedForAsign[0];
+      }
+      const ident = docTemplateForHints
+        ? String(docTemplateForHints.asign_template_ident || '').trim()
+        : '';
+      if (ident) {
+        const tplRes = await getAsignTemplateData({ template_ident: ident });
+        if (tplRes.ok) {
+          const parsed = extractAsignTemplateControlHints(tplRes.data);
+          if (parsed.signKeys.length > 0) {
+            asignTemplateHints = parsed;
+          }
+        }
+      }
+    }
+
     return {
       contractNo,
       effectiveContractNo,
       contractName,
       asign: data,
-      asignTemplateHints: undefined,
+      asignTemplateHints,
     };
   };
 
@@ -3239,15 +3265,36 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
   // 撤回签署
   const handleWithdrawSigning = async (signing: SigningRecord) => {
     // 确认对话框
-    if (!confirm(`确定要撤回该签署吗？\n\n员工：${signing.employee_name}\n文书数量：${signing.document_count}份\n\n撤回后该签署将被标记为已撤回状态。`)) {
+    if (!confirm(`确定要撤回该签署吗？\n\n员工：${signing.employee_form_data?.name ?? ''}\n文书数量：${signing.template_ids.length}份\n\n撤回后该签署将被标记为已撤回状态。`)) {
       return;
     }
 
     try {
+      const contractNo = String(signing.third_party_contract_no ?? '').trim();
+      if (contractNo) {
+        const withdrawRes = await withdrawAsignContract({
+          signingRecordId: signing.id,
+          contractNo,
+          withdrawReason: '业务侧撤回签署记录',
+          isNoticeSignUser: false,
+        });
+        if (!withdrawRes.ok) {
+          const detailText =
+            withdrawRes.detail === undefined
+              ? ''
+              : typeof withdrawRes.detail === 'string'
+              ? withdrawRes.detail
+              : JSON.stringify(withdrawRes.detail);
+          toast.error('撤回爱签合同失败', detailText ? { description: detailText.slice(0, 220) } : undefined);
+          return;
+        }
+      }
+
       // 更新签署记录状态为已撤回
       const success = await updateSigningRecord(signing.id, {
         status: 'withdrawn'
       });
+      
 
       if (success) {
         toast.success('签署已撤回');

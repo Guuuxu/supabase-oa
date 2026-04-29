@@ -5,6 +5,7 @@
 import type { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const LOG = "[ASIGN_NOTIFY]";
+const SYNC_TRACE_LOG = "[ASIGN_SYNC_TRACE]";
 
 export function sanitizeStorageSegment(s: string): string {
   return s.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120);
@@ -112,6 +113,13 @@ export async function uploadPdfBytesAndAttachToSigningRecords(
     ? sanitizeStorageSegment(String(opts.contractNo))
     : sanitizeStorageSegment(recordIds[0].slice(0, 8));
   const path = `signed/${prefix}_${keyPart}_${Date.now()}.pdf`;
+  console.log(SYNC_TRACE_LOG, "storage_upload_signing_records_start", {
+    contractNo: opts.contractNo ?? null,
+    recordCount: recordIds.length,
+    path,
+    byteLength: pdfBytes.byteLength,
+    bytesHead: Array.from(pdfBytes.slice(0, 16)),
+  });
 
   const { error: upErr } = await admin.storage.from("signed-documents").upload(path, pdfBytes, {
     cacheControl: "3600",
@@ -124,6 +132,11 @@ export async function uploadPdfBytesAndAttachToSigningRecords(
   }
 
   const { data: pub } = admin.storage.from("signed-documents").getPublicUrl(path);
+  console.log(SYNC_TRACE_LOG, "storage_upload_signing_records_done", {
+    contractNo: opts.contractNo ?? null,
+    path,
+    rawPublicUrl: pub.publicUrl,
+  });
   console.log(LOG, "URL规范化入参", {
     rawPublicUrl: pub.publicUrl,
     supabasePublicUrl: (Deno.env.get("SUPABASE_PUBLIC_URL") ?? "").trim(),
@@ -239,6 +252,115 @@ export async function applyExternalSignedFileUrlToSigningRecords(
     }
   }
 
+  return { ok: true, publicUrl: url, updatedRecordCount: recordIds.length };
+}
+
+export async function uploadPdfBytesAndAttachToSalarySignatures(
+  admin: SupabaseClient,
+  pdfBytes: Uint8Array,
+  opts: {
+    contractNo: string;
+    uploadedBy: string | null;
+    fileNamePrefix?: string;
+  },
+): Promise<PersistSignedPdfResult> {
+  const cn = String(opts.contractNo ?? "").trim();
+  if (!cn) {
+    return { ok: false, error: "[stage=resolve_contract_no] contractNo 为空" };
+  }
+  const { data: rows, error } = await admin
+    .from("salary_signatures")
+    .select("id")
+    .eq("third_party_contract_no", cn);
+  if (error) {
+    return { ok: false, error: `[stage=query_salary_signatures] ${error.message}` };
+  }
+  const recordIds = (rows ?? []).map((r: { id: string }) => r.id);
+  if (recordIds.length === 0) {
+    return { ok: false, error: "[stage=query_salary_signatures] 未找到匹配的薪酬签署记录" };
+  }
+
+  const prefix = opts.fileNamePrefix ?? "salary-asign";
+  const keyPart = sanitizeStorageSegment(cn);
+  const path = `signed/${prefix}_${keyPart}_${Date.now()}.pdf`;
+  console.log(SYNC_TRACE_LOG, "storage_upload_salary_signatures_start", {
+    contractNo: cn,
+    recordCount: recordIds.length,
+    path,
+    byteLength: pdfBytes.byteLength,
+    bytesHead: Array.from(pdfBytes.slice(0, 16)),
+  });
+  const { error: upErr } = await admin.storage.from("signed-documents").upload(path, pdfBytes, {
+    cacheControl: "3600",
+    upsert: false,
+    contentType: "application/pdf",
+  });
+  if (upErr) {
+    return { ok: false, error: `[stage=storage_upload] ${upErr.message}` };
+  }
+
+  const { data: pub } = admin.storage.from("signed-documents").getPublicUrl(path);
+  console.log(SYNC_TRACE_LOG, "storage_upload_salary_signatures_done", {
+    contractNo: cn,
+    path,
+    rawPublicUrl: pub.publicUrl,
+  });
+  const publicUrl = normalizePublicStorageUrl(pub.publicUrl);
+  const now = new Date().toISOString();
+  const { error: updErr } = await admin
+    .from("salary_signatures")
+    .update({
+      signed_file_url: publicUrl,
+      signed_at: now,
+      status: "signed",
+      updated_at: now,
+    })
+    .eq("third_party_contract_no", cn)
+    .in("status", ["pending", "sent", "signed"]);
+  if (updErr) {
+    return { ok: false, error: `[stage=update_salary_signatures] ${updErr.message}` };
+  }
+  return { ok: true, publicUrl, updatedRecordCount: recordIds.length };
+}
+
+export async function applyExternalSignedFileUrlToSalarySignatures(
+  admin: SupabaseClient,
+  contractNo: string,
+  fileUrl: string,
+): Promise<PersistSignedPdfResult> {
+  const cn = String(contractNo ?? "").trim();
+  if (!cn) {
+    return { ok: false, error: "[stage=resolve_contract_no] contractNo 为空" };
+  }
+  const url = String(fileUrl ?? "").trim();
+  if (!url || !/^https?:\/\//i.test(url)) {
+    return { ok: false, error: "[stage=validate_file_url] fileUrl 非法" };
+  }
+  const { data: rows, error } = await admin
+    .from("salary_signatures")
+    .select("id")
+    .eq("third_party_contract_no", cn);
+  if (error) {
+    return { ok: false, error: `[stage=query_salary_signatures] ${error.message}` };
+  }
+  const recordIds = (rows ?? []).map((r: { id: string }) => r.id);
+  if (recordIds.length === 0) {
+    return { ok: false, error: "[stage=query_salary_signatures] 未找到匹配的薪酬签署记录" };
+  }
+  const now = new Date().toISOString();
+  const { error: updErr } = await admin
+    .from("salary_signatures")
+    .update({
+      signed_file_url: url,
+      signed_at: now,
+      status: "signed",
+      updated_at: now,
+    })
+    .eq("third_party_contract_no", cn)
+    .in("status", ["pending", "sent", "signed"]);
+  if (updErr) {
+    return { ok: false, error: `[stage=update_salary_signatures] ${updErr.message}` };
+  }
   return { ok: true, publicUrl: url, updatedRecordCount: recordIds.length };
 }
 

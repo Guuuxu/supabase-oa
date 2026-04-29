@@ -1501,6 +1501,10 @@ export type DownloadAsignContractSyncResult =
   | { ok: true; publicUrl: string; updatedRecordCount: number; fallback?: string }
   | { ok: false; error: string; detail?: unknown; debug?: unknown };
 
+export type WithdrawAsignContractResult =
+  | { ok: true; contractNo: string; data?: unknown }
+  | { ok: false; error: string; detail?: unknown; debug?: unknown };
+
 export async function downloadAsignContractAndSyncArchive(params: {
   signingRecordId?: string;
   contractNo?: string;
@@ -1646,6 +1650,45 @@ export async function downloadAsignContractAndSyncArchive(params: {
     error: errMsg,
     detail: payload?.detail,
     debug: payload?.debug,
+  };
+}
+
+/** 调用 Edge withdraw-asign-contract：撤回爱签合同（contract/withdraw） */
+export async function withdrawAsignContract(params: {
+  signingRecordId?: string;
+  contractNo?: string;
+  withdrawReason?: string;
+  isNoticeSignUser?: boolean;
+}): Promise<WithdrawAsignContractResult> {
+  const { data, error } = await supabase.functions.invoke('withdraw-asign-contract', {
+    body: {
+      signing_record_id: params.signingRecordId,
+      contract_no: params.contractNo,
+      withdraw_reason: params.withdrawReason,
+      is_notice_sign_user: params.isNoticeSignUser === true,
+    },
+  });
+
+  if (error) {
+    return { ok: false, error: error.message };
+  }
+
+  const payload = data as Record<string, unknown> | null;
+  if (!payload || payload.ok !== true) {
+    const errMsg = payload && typeof payload.error === 'string' ? payload.error : '撤回爱签合同失败';
+    return {
+      ok: false,
+      error: errMsg,
+      detail: payload?.detail,
+      debug: payload?.debug,
+    };
+  }
+
+  const contractNo = typeof payload.contract_no === 'string' ? payload.contract_no : '';
+  return {
+    ok: true,
+    contractNo,
+    data: payload.data,
   };
 }
 

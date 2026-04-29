@@ -15,4 +15,8 @@ interface ImportMetaEnv {
    * 默认不传；勿填模板里不存在的 key，否则会报 100617。
    */
   readonly VITE_ASIGN_PARTY_B_EXTRA_SIGN_KEYS?: string;
+  /**
+   * 薪酬签署 addSigner：当 create-signing 返回体解析不到签署位时，指定员工主签署位 signKey，须与控制台一致，常用「个人」或「乙方」。
+   */
+  readonly VITE_ASIGN_SALARY_MAIN_SIGN_KEY?: string;
 }
