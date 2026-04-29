@@ -413,7 +413,7 @@ export async function generateSignedSalarySlipPDF(
 export async function uploadPDFToStorage(
   blob: Blob,
   fileName: string,
-  bucket: string = 'signature-files'
+  bucket: string = 'signed-documents'
 ): Promise<string | null> {
   try {
     const { supabase } = await import('@/db/supabase');
@@ -424,24 +424,25 @@ export async function uploadPDFToStorage(
     const safeFileName = `${randomId}_${timestamp}.pdf`;
     const filePath = `salary-slips/${safeFileName}`;
     
-    const { data, error } = await supabase.storage
-      .from(bucket)
-      .upload(filePath, blob, {
-        contentType: 'application/pdf',
-        upsert: true
-      });
+    const bucketCandidates = Array.from(new Set([bucket, 'signed-documents', 'signature-files']));
 
-    if (error) {
-      console.error('上传PDF失败:', error);
-      return null;
+    for (const currentBucket of bucketCandidates) {
+      const { error } = await supabase.storage
+        .from(currentBucket)
+        .upload(filePath, blob, {
+          contentType: 'application/pdf',
+          upsert: true
+        });
+
+      if (!error) {
+        const { data: urlData } = supabase.storage
+          .from(currentBucket)
+          .getPublicUrl(filePath);
+        return urlData.publicUrl;
+      }
     }
 
-    // 获取公开URL
-    const { data: urlData } = supabase.storage
-      .from(bucket)
-      .getPublicUrl(filePath);
-
-    return urlData.publicUrl;
+    return null;
   } catch (error) {
     console.error('上传PDF异常:', error);
     return null;

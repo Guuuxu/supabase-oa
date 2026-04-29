@@ -49,9 +49,7 @@ import {
   getEmployees,
   getEmployeesByCompany,
   getCurrentUserPermissions,
-  createSalarySignaturesBatch,
-  updateAttendanceRecord,
-  updateSalarySignatureFileUrl
+  updateAttendanceRecord
 } from '@/db/api';
 import { generateAttendanceRecordPDF, uploadPDFToStorage } from '@/utils/pdfGenerator';
 import type { AttendanceRecord, Company, Employee } from '@/types/types';
@@ -167,9 +165,6 @@ export default function AttendancePage() {
         if (pdfUrl) {
           // 更新考勤记录，保存PDF URL
           await updateAttendanceRecord(record.id, { pdf_url: pdfUrl });
-          
-          // 更新签署记录，保存原始文件URL
-          await updateSalarySignatureFileUrl(record.id, record.employee_id, pdfUrl, 'attendance_record');
 
           successCount++;
         } else {
@@ -274,24 +269,7 @@ export default function AttendancePage() {
 
       // 批量创建考勤记录
       const createdRecords = await createAttendanceRecordsBatch(attendanceRecords);
-
-      // 自动创建薪酬签署记录（使用创建后的记录ID）
-      const signatureRecords = createdRecords.map(record => {
-        const [year, month] = record.month.split('-').map(Number);
-        return {
-          company_id: record.company_id,
-          employee_id: record.employee_id,
-          type: 'attendance_record' as const,
-          reference_id: record.id, // 使用考勤记录ID
-          year,
-          month,
-          status: 'pending' as const
-        };
-      });
-
-      await createSalarySignaturesBatch(signatureRecords);
-
-      alert(`上传成功：成功导入 ${createdRecords.length} 条考勤记录并创建签署任务`);
+      alert(`上传成功：成功导入 ${createdRecords.length} 条考勤记录`);
 
       // 获取公司信息
       const company = companies.find(c => c.id === selectedCompanyId);

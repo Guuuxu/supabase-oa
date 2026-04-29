@@ -36,7 +36,6 @@ import {
   Upload, 
   FileSpreadsheet, 
   Eye, 
-  Send, 
   Trash2, 
   Download, 
   AlertCircle, 
@@ -57,10 +56,7 @@ import {
   deleteSalaryRecord,
   getSalaryItems,
   createSalaryItems,
-  markSalaryItemsAsSent,
-  createSalarySignaturesBatch,
   updateSalaryItem,
-  updateSalarySignatureFileUrl,
   createSalaryStructureTemplate,
   updateSalaryStructureTemplate
 } from '@/db/api';
@@ -148,6 +144,7 @@ export default function SalaryRecordsPage() {
   ) => {
     let successCount = 0;
     let failCount = 0;
+    const failDetails: string[] = [];
 
     for (const item of salaryItems) {
       try {
@@ -174,16 +171,16 @@ export default function SalaryRecordsPage() {
         if (pdfUrl) {
           // 更新工资条记录，保存PDF URL
           await updateSalaryItem(item.id, { pdf_url: pdfUrl });
-          
-          // 更新签署记录，保存原始文件URL
-          await updateSalarySignatureFileUrl(salaryRecordId, item.employee_id, pdfUrl, 'salary_slip');
 
           successCount++;
         } else {
+          failDetails.push(`${item.employee_name}：上传PDF到存储失败`);
           failCount++;
         }
       } catch (error) {
         console.error(`生成PDF失败 - ${item.employee_name}:`, error);
+        const errorMessage = error instanceof Error ? error.message : '未知错误';
+        failDetails.push(`${item.employee_name}：${errorMessage}`);
         failCount++;
       }
     }
@@ -198,7 +195,10 @@ export default function SalaryRecordsPage() {
     if (failCount === 0) {
       toast.success(`所有工资条PDF已生成完成（${successCount}个）`);
     } else {
-      toast.warning(`PDF生成完成：成功${successCount}个，失败${failCount}个`);
+      const preview = failDetails.slice(0, 2).join('；');
+      toast.warning(
+        `PDF生成完成：成功${successCount}个，失败${failCount}个${preview ? `。${preview}` : ''}`
+      );
     }
 
     // 刷新数据
@@ -207,6 +207,70 @@ export default function SalaryRecordsPage() {
 
   const parseExcelFile = async (file: File, template: SalaryStructureTemplate, companyId: string): Promise<{ data: any[], errors: string[] }> => {
     return new Promise((resolve) => {
+      const normalizeHeaderKey = (key: string): string => {
+        return key
+          .replace(/\u3000/g, ' ')
+          .replace(/\s+/g, '')
+          .trim()
+          .toLowerCase();
+      };
+
+      const parseAmount = (raw: unknown): number | null => {
+        if (typeof raw === 'number') {
+          return Number.isFinite(raw) ? raw : null;
+        }
+        if (typeof raw !== 'string') {
+          return null;
+        }
+        const cleaned = raw.replace(/[,\s￥¥]/g, '');
+        if (!cleaned) {
+          return null;
+        }
+        const parsed = Number(cleaned);
+        return Number.isFinite(parsed) ? parsed : null;
+      };
+
+      const getRowValueByCandidates = (
+        row: Record<string, unknown>,
+        normalizedRow: Record<string, unknown>,
+        candidates: string[],
+      ): unknown => {
+        for (const candidate of candidates) {
+          if (Object.prototype.hasOwnProperty.call(row, candidate)) {
+            return row[candidate];
+          }
+          const trimmed = candidate.trim();
+          if (trimmed && Object.prototype.hasOwnProperty.call(row, trimmed)) {
+            return row[trimmed];
+          }
+          const normalizedCandidate = normalizeHeaderKey(candidate);
+          if (normalizedCandidate && Object.prototype.hasOwnProperty.call(normalizedRow, normalizedCandidate)) {
+            return normalizedRow[normalizedCandidate];
+          }
+        }
+        return undefined;
+      };
+
+      const resolveNetOrGrossFromRow = (row: Record<string, unknown>, salaryData: Record<string, number | string>): number | null => {
+        const rowNetKeys = ['实发工资', '实发', '应发工资', '应发'];
+        for (const key of rowNetKeys) {
+          const amount = parseAmount(row[key]);
+          if (amount !== null) {
+            return amount;
+          }
+        }
+
+        const dataNetKeys = ['net_salary', 'gross_salary', 'actual_salary', 'payable_salary'];
+        for (const key of dataNetKeys) {
+          const amount = parseAmount(salaryData[key]);
+          if (amount !== null) {
+            return amount;
+          }
+        }
+
+        return null;
+      };
+
       const reader = new FileReader();
       reader.onload = (e) => {
         try {
@@ -230,10 +294,20 @@ export default function SalaryRecordsPage() {
           // 验证和解析每一行数据
           jsonData.forEach((row: any, index: number) => {
             const rowNumber = index + 2; // Excel行号从2开始（第1行是表头）
+            const normalizedRow: Record<string, unknown> = {};
+            for (const [k, v] of Object.entries(row)) {
+              if (typeof k !== 'string') {
+                continue;
+              }
+              const normalizedKey = normalizeHeaderKey(k);
+              if (normalizedKey) {
+                normalizedRow[normalizedKey] = v;
+              }
+            }
 
             // 查找员工（支持新旧格式）
-            const employeeName = row['员工姓名'] || row['姓名'];
-            const employeeIdCard = row['员工身份证号'] || row['员工身份证号码'] || row['身份证号码'] || row['身份证号'];
+            const employeeName = getRowValueByCandidates(row, normalizedRow, ['员工姓名', '姓名']);
+            const employeeIdCard = getRowValueByCandidates(row, normalizedRow, ['员工身份证号', '员工身份证号码', '身份证号码', '身份证号']);
 
             if (!employeeName) {
               errors.push(`第${rowNumber}行：缺少员工姓名`);
@@ -256,19 +330,33 @@ export default function SalaryRecordsPage() {
             // 解析工资字段
             const salaryData: Record<string, number | string> = {};
             let totalAmount = 0;
+            let incomeSubtotal = 0;
+            let deductionSubtotal = 0;
+            let parsedNumericFieldCount = 0;
 
             template.fields.forEach((field: SalaryStructureField) => {
-              const value = row[field.name];
+              const value = getRowValueByCandidates(row, normalizedRow, [field.name, field.code]);
               if (value !== undefined && value !== null && value !== '') {
                 if (field.type === 'number') {
-                  const numValue = parseFloat(value);
-                  if (!isNaN(numValue)) {
+                  const parsedAmount = parseAmount(value);
+                  if (parsedAmount !== null) {
+                    const numValue = parsedAmount;
                     salaryData[field.code] = numValue;
-                    // 累加到总金额（假设所有数字字段都是金额）
-                    if (field.code.includes('salary') || field.code.includes('bonus') || field.code.includes('allowance')) {
-                      totalAmount += numValue;
-                    } else if (field.code.includes('deduction') || field.code.includes('tax')) {
-                      totalAmount -= numValue;
+                    parsedNumericFieldCount += 1;
+                    // 收入/扣减分类统计：优先按 code，其次按字段名关键词，避免模板命名差异导致总额为 0
+                    const code = field.code.toLowerCase();
+                    const name = field.name.toLowerCase();
+                    const isDeduction =
+                      code.includes('deduction') ||
+                      code.includes('tax') ||
+                      name.includes('扣') ||
+                      name.includes('税') ||
+                      name.includes('险') ||
+                      name.includes('公积金');
+                    if (isDeduction) {
+                      deductionSubtotal += numValue;
+                    } else {
+                      incomeSubtotal += numValue;
                     }
                   } else {
                     errors.push(`第${rowNumber}行：字段"${field.name}"的值"${value}"不是有效数字`);
@@ -281,11 +369,16 @@ export default function SalaryRecordsPage() {
               }
             });
 
-            // 如果有"实发工资"或"应发工资"字段，使用它作为总金额
-            if (row['实发工资']) {
-              totalAmount = parseFloat(row['实发工资']);
-            } else if (row['应发工资']) {
-              totalAmount = parseFloat(row['应发工资']);
+            const resolvedAmount = resolveNetOrGrossFromRow(normalizedRow, salaryData);
+            if (resolvedAmount !== null) {
+              totalAmount = resolvedAmount;
+            } else {
+              totalAmount = incomeSubtotal - deductionSubtotal;
+            }
+
+            if (parsedNumericFieldCount === 0 && totalAmount === 0) {
+              errors.push(`第${rowNumber}行：未识别到任何工资数字字段，请检查Excel表头与工资结构模板字段名称是否一致`);
+              return;
             }
 
             parsedData.push({
@@ -323,6 +416,8 @@ export default function SalaryRecordsPage() {
       return;
     }
 
+    let createdSalaryRecordId: string | null = null;
+
     try {
       // 解析Excel文件（传递公司ID）
       const { data, errors } = await parseExcelFile(formData.file, template, formData.company_id);
@@ -356,6 +451,7 @@ export default function SalaryRecordsPage() {
         toast.error('创建工资记录失败');
         return;
       }
+      createdSalaryRecordId = salaryRecord.id;
 
       // 批量创建工资条
       const salaryItemsData = data.map(item => ({
@@ -365,22 +461,7 @@ export default function SalaryRecordsPage() {
 
       const createdItems = await createSalaryItems(salaryItemsData);
 
-      // 自动创建薪酬签署记录
-      const signatureRecords = data.map(item => ({
-        company_id: formData.company_id,
-        employee_id: item.employee_id,
-        type: 'salary_slip' as const,
-        document_template_id: formData.template_id,
-        document_name: template.name,
-        reference_id: salaryRecord.id,
-        year: formData.year,
-        month: formData.month,
-        status: 'pending' as const
-      }));
-
-      await createSalarySignaturesBatch(signatureRecords);
-
-      toast.success(`工资表上传成功，已为 ${data.length} 名员工生成工资条和签署记录`);
+      toast.success(`工资表上传成功，已为 ${data.length} 名员工生成工资条`);
       
       // 后台生成PDF（不阻塞用户操作）
       toast.info('正在后台生成工资条PDF文件，请稍候...');
@@ -399,6 +480,14 @@ export default function SalaryRecordsPage() {
       loadData();
     } catch (error: any) {
       console.error('上传工资表失败:', error);
+      if (createdSalaryRecordId) {
+        try {
+          await deleteSalaryRecord(createdSalaryRecordId);
+          console.warn('上传失败已回滚工资记录:', createdSalaryRecordId);
+        } catch (rollbackError) {
+          console.error('上传失败后回滚工资记录失败:', rollbackError);
+        }
+      }
       if (error.message?.includes('duplicate key')) {
         toast.error('该公司该月份的工资记录已存在');
       } else {
@@ -412,21 +501,6 @@ export default function SalaryRecordsPage() {
     const items = await getSalaryItems(record.id);
     setSalaryItems(items);
     setPreviewDialogOpen(true);
-  };
-
-  const handleSendSalarySlips = async (recordId: string) => {
-    if (!confirm('确定要发送工资条给所有员工吗？')) {
-      return;
-    }
-
-    try {
-      await markSalaryItemsAsSent(recordId);
-      await updateSalaryRecord(recordId, { status: 'sent' });
-      toast.success('工资条已发送');
-      loadData();
-    } catch (error) {
-      toast.error('发送失败');
-    }
   };
 
   const handleDelete = async (id: string) => {
@@ -501,7 +575,7 @@ export default function SalaryRecordsPage() {
     if (template) {
       setEditingTemplate(template);
       setTemplateFormData({
-        company_id: template.company_id,
+        company_id: template.company_id || '',
         name: template.name,
         description: template.description || '',
         fields: template.fields || [],
@@ -673,7 +747,6 @@ export default function SalaryRecordsPage() {
                     <TableHead className="whitespace-nowrap min-w-[200px]">所属公司</TableHead>
                     <TableHead className="whitespace-nowrap">员工数量</TableHead>
                     <TableHead className="whitespace-nowrap">总金额</TableHead>
-                    <TableHead className="whitespace-nowrap">状态</TableHead>
                     <TableHead className="whitespace-nowrap">上传时间</TableHead>
                     <TableHead className="text-right whitespace-nowrap">操作</TableHead>
                   </TableRow>
@@ -690,15 +763,6 @@ export default function SalaryRecordsPage() {
                         <TableCell className="whitespace-nowrap">{record.employee_count || 0} 人</TableCell>
                         <TableCell className="whitespace-nowrap">¥{record.total_amount?.toFixed(2) || '0.00'}</TableCell>
                         <TableCell className="whitespace-nowrap">
-                          {record.status === 'sent' ? (
-                            <Badge>已发送</Badge>
-                          ) : record.status === 'processed' ? (
-                            <Badge variant="secondary">已处理</Badge>
-                          ) : (
-                            <Badge variant="outline">待处理</Badge>
-                          )}
-                        </TableCell>
-                        <TableCell className="whitespace-nowrap">
                           {new Date(record.created_at).toLocaleString('zh-CN')}
                         </TableCell>
                         <TableCell className="text-right whitespace-nowrap">
@@ -710,15 +774,6 @@ export default function SalaryRecordsPage() {
                             >
                               <Eye className="h-4 w-4" />
                             </Button>
-                            {record.status !== 'sent' && (
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                onClick={() => handleSendSalarySlips(record.id)}
-                              >
-                                <Send className="h-4 w-4" />
-                              </Button>
-                            )}
                             <Button
                               variant="ghost"
                               size="sm"

@@ -65,6 +65,7 @@ import {
   createSalarySignaturesBatch,
   addAsignSignatory,
   downloadAsignContractAndSyncArchive,
+  withdrawAsignContract,
 } from '@/db/api';
 import { supabase } from '@/db/supabase';
 import { useAuth } from '@/contexts/AuthContext';
@@ -156,7 +157,7 @@ function buildSalaryExtraFillData(data: Record<string, number | string> | undefi
     add(k, v);
   }
 
-  const aliasPairs: Array<[string, string]> = [
+  const aliasPairs: Array<[string, string] | [string]> = [
     ['base_salary', '基本工资'],
     ['position_salary', '岗位工资'],
     ['performance_bonus', '绩效奖金'],
@@ -171,6 +172,23 @@ function buildSalaryExtraFillData(data: Record<string, number | string> | undefi
     ['personal_income_tax', '个人所得税'],
     ['other_deductions', '其他扣款'],
     ['net_salary', '实发工资'],
+    ['出勤', '出勤天数'],
+    ['平时加班', '平时加班费'],
+    ['周末加班', '周末加班费'],
+    ['节假日加班', '节假日加班费'],
+    ['迟到'],
+    ['早退'],
+    ['旷工'],
+    ['请假'],
+    ['病假'],
+    ['事假'],
+    ['年假'],
+    ['婚假'],
+    ['产假'],
+    ['陪产假'],
+    ['丧假'],
+    ['旷工'],
+    ['调休'],
   ];
 
   for (const [code, label] of aliasPairs) {
@@ -329,6 +347,31 @@ export default function SalarySignaturesPage() {
     setLoading(false);
   };
 
+  const withdrawContractIfNeeded = async (signature: SalarySignature): Promise<boolean> => {
+    const contractNo = String(signature.third_party_contract_no ?? '').trim();
+    if (!contractNo) {
+      return true;
+    }
+    const withdrawRes = await withdrawAsignContract({
+      contractNo,
+      withdrawReason: '业务侧撤回薪酬签署记录',
+      isNoticeSignUser: false,
+    });
+    if (!withdrawRes.ok) {
+      let detailText = '';
+      if (withdrawRes.detail !== undefined) {
+        if (typeof withdrawRes.detail === 'string') {
+          detailText = withdrawRes.detail;
+        } else {
+          detailText = JSON.stringify(withdrawRes.detail);
+        }
+      }
+      toast.error('撤回爱签合同失败', detailText ? { description: detailText.slice(0, 220) } : undefined);
+      return false;
+    }
+    return true;
+  };
+
   // 撤回签署
   const handleRevoke = async (signature: SalarySignature) => {
     if (signature.status !== 'sent' && signature.status !== 'pending') {
@@ -340,15 +383,25 @@ export default function SalarySignaturesPage() {
       return;
     }
 
-    const success = await updateSalarySignature(signature.id, {
-      status: 'revoked',
-      sent_at: undefined
-    });
+    try {
+      const withdrawSuccess = await withdrawContractIfNeeded(signature);
+      if (!withdrawSuccess) {
+        return;
+      }
 
-    if (success) {
-      toast.success('撤回成功');
-      loadData();
-    } else {
+      const success = await updateSalarySignature(signature.id, {
+        status: 'revoked',
+        sent_at: undefined
+      });
+
+      if (success) {
+        toast.success('撤回成功');
+        loadData();
+      } else {
+        toast.error('撤回失败');
+      }
+    } catch (error) {
+      console.error('撤回签署失败:', error);
       toast.error('撤回失败');
     }
   };
@@ -447,6 +500,11 @@ export default function SalarySignaturesPage() {
     for (const id of selectedSalaryIds) {
       const signature = signatures.find(s => s.id === id);
       if (signature && (signature.status === 'sent' || signature.status === 'pending')) {
+        const withdrawSuccess = await withdrawContractIfNeeded(signature);
+        if (!withdrawSuccess) {
+          failCount++;
+          continue;
+        }
         const success = await updateSalarySignature(id, {
           status: 'revoked',
           sent_at: undefined
