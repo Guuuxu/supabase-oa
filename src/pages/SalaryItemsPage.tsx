@@ -1,7 +1,6 @@
 import { useState, useEffect } from 'react';
 import { MainLayout } from '@/components/layouts/MainLayout';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
   Table,
@@ -18,11 +17,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { Badge } from '@/components/ui/badge';
 import { 
   Search, 
-  Download, 
-  Eye,
   FileText,
   Calendar,
   Building2,
@@ -110,24 +106,6 @@ export default function SalaryItemsPage() {
     if (!record) return '-';
     const company = companies.find(c => c.id === record.company_id);
     return company?.name || '-';
-  };
-
-  // 下载PDF
-  const handleDownloadPDF = (item: SalaryItem) => {
-    if (!item.pdf_url) {
-      toast.error('PDF文件不存在');
-      return;
-    }
-    window.open(item.pdf_url, '_blank');
-  };
-
-  // 预览PDF
-  const handlePreviewPDF = (item: SalaryItem) => {
-    if (!item.pdf_url) {
-      toast.error('PDF文件不存在');
-      return;
-    }
-    window.open(item.pdf_url, '_blank');
   };
 
   // 获取可选的工资记录（根据选中的公司）
@@ -249,8 +227,6 @@ export default function SalaryItemsPage() {
                       <TableHead>所属公司</TableHead>
                       <TableHead>工资期间</TableHead>
                       <TableHead>实发工资</TableHead>
-                      <TableHead>PDF状态</TableHead>
-                      <TableHead>操作</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -280,41 +256,6 @@ export default function SalaryItemsPage() {
                             <span className="font-semibold text-primary">
                               ¥{item.total_amount?.toFixed(2) || '0.00'}
                             </span>
-                          </TableCell>
-                          <TableCell>
-                            {item.pdf_url ? (
-                              <Badge variant="default" className="bg-green-500">
-                                已生成
-                              </Badge>
-                            ) : (
-                              <Badge variant="secondary">
-                                未生成
-                              </Badge>
-                            )}
-                          </TableCell>
-                          <TableCell>
-                            <div className="flex items-center gap-2">
-                              {item.pdf_url && (
-                                <>
-                                  <Button
-                                    variant="ghost"
-                                    size="sm"
-                                    onClick={() => handlePreviewPDF(item)}
-                                    title="预览PDF"
-                                  >
-                                    <Eye className="h-4 w-4" />
-                                  </Button>
-                                  <Button
-                                    variant="ghost"
-                                    size="sm"
-                                    onClick={() => handleDownloadPDF(item)}
-                                    title="下载PDF"
-                                  >
-                                    <Download className="h-4 w-4" />
-                                  </Button>
-                                </>
-                              )}
-                            </div>
                           </TableCell>
                         </TableRow>
                       );

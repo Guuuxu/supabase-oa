@@ -68,11 +68,22 @@ import {
   addAsignSignatory,
   getAsignTemplateList,
   getAsignTemplateData,
+  getAttendanceRecordsByEmployee,
   type AsignAddSignerItem,
   type AsignSignStrategyItem,
 } from '@/db/api';
 import { SIGNING_STATUS_LABELS, DOCUMENT_CATEGORY_LABELS, DOCUMENT_CATEGORY_LABELS_WITH_UNIVERSAL } from '@/types/types';
-import type { SigningRecord, Company, Employee, DocumentTemplate, SigningStatus, SigningMode, DocumentCategory, DocumentCategoryWithUniversal } from '@/types/types';
+import type {
+  SigningRecord,
+  Company,
+  Employee,
+  DocumentTemplate,
+  SigningStatus,
+  SigningMode,
+  DocumentCategory,
+  DocumentCategoryWithUniversal,
+  AttendanceRecord,
+} from '@/types/types';
 import { toast } from 'sonner';
 import { Plus, Eye, Check, ChevronsUpDown, Download, FileText, X, Search, CloudDownload } from 'lucide-react';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -80,7 +91,10 @@ import { useAuth } from '@/contexts/AuthContext';
 import { cn } from '@/lib/utils';
 import { supabase } from '@/db/supabase';
 import { htmlStringToPdfBlob } from '@/utils/htmlToPdf';
-import { buildAsignFillDataForContract } from '@/utils/asignFillData';
+import {
+  buildAsignFillDataForContract,
+  pickAttendanceRecordForContractFill,
+} from '@/utils/asignFillData';
 import {
   extractAsignTemplateControlHints,
   mergeTemplateDateSignKeysForAddSigner,
@@ -3147,7 +3161,21 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
         );
       }
       const companyForFill = opts?.companyFormSnapshot ?? finalCompanyFormData;
-      const fillCore = buildAsignFillDataForContract(fillEmp, companyForFill);
+      let attendanceForFill: AttendanceRecord | null = null;
+      if (fillEmp.id) {
+        try {
+          const attendanceRows = await getAttendanceRecordsByEmployee(fillEmp.id);
+          attendanceForFill = pickAttendanceRecordForContractFill(
+            attendanceRows,
+            fillEmp.contract_start_date,
+          );
+        } catch (e) {
+          console.warn('[SigningsFill] 拉取员工考勤用于 fillData 失败', e);
+        }
+      }
+      const fillCore = buildAsignFillDataForContract(fillEmp, companyForFill, {
+        attendanceRecord: attendanceForFill ?? undefined,
+      });
       const fillData = fillCore;
       const rawName = (docTemplate.name || '文书').trim();
       const fileName = rawName
@@ -5131,7 +5159,7 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                 )}
                 
                 {/* 电子签署模式：显示签署按钮 */}
-                {selectedSigning.signing_mode === 'electronic' && selectedSigning.status === 'pending' && (
+                {/* {selectedSigning.signing_mode === 'electronic' && selectedSigning.status === 'pending' && (
                   <div className="flex gap-2 pt-4">
                     <Button
                       onClick={() => handleUpdateStatus(selectedSigning.id, 'employee_signed')}
@@ -5146,7 +5174,7 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                       拒绝
                     </Button>
                   </div>
-                )}
+                )} */}
                 
                 {/* 线下签署模式：上传后显示完成按钮 */}
                 {selectedSigning.signing_mode === 'offline' && selectedSigning.signed_file_url && selectedSigning.status === 'pending' && (

@@ -66,12 +66,14 @@ import {
   addAsignSignatory,
   downloadAsignContractAndSyncArchive,
   withdrawAsignContract,
+  getAttendanceRecords,
 } from '@/db/api';
 import { supabase } from '@/db/supabase';
 import { useAuth } from '@/contexts/AuthContext';
 import type {
   SalarySignature,
   AttendanceSignature,
+  AttendanceRecord,
   Company,
   SalarySignatureStatus,
   SalarySignatureType,
@@ -79,6 +81,7 @@ import type {
   Employee,
 } from '@/types/types';
 import type { AsignContractFillCompany, AsignContractFillEmployee } from '@/utils/asignFillData';
+import { buildAsignFillDataFromAttendanceRecord } from '@/utils/asignFillData';
 import {
   extractAsignCreateContractPreviewUrl,
   buildAsignStrangersForSalarySigning,
@@ -175,11 +178,12 @@ function buildSalaryExtraFillData(data: Record<string, number | string> | undefi
     ['出勤', '出勤天数'],
     ['平时加班', '平时加班费'],
     ['周末加班', '周末加班费'],
+    ['缺勤天数', '缺勤'],
     ['节假日加班', '节假日加班费'],
-    ['迟到'],
-    ['早退'],
-    ['旷工'],
-    ['请假'],
+    ['迟到', '迟到次数'],
+    ['早退', '早退天数'],
+    ['旷工', '旷工天数'],
+    ['请假', '请假天数'],
     ['病假'],
     ['事假'],
     ['年假'],
@@ -189,6 +193,7 @@ function buildSalaryExtraFillData(data: Record<string, number | string> | undefi
     ['丧假'],
     ['旷工'],
     ['调休'],
+    ['备注']
   ];
 
   for (const [code, label] of aliasPairs) {
@@ -1129,6 +1134,19 @@ export default function SalarySignaturesPage() {
       return;
     }
 
+    const batchMonthStr = `${year}-${String(month).padStart(2, '0')}`;
+    const attendanceByEmployeeId = new Map<string, AttendanceRecord>();
+    try {
+      const attendanceRows = await getAttendanceRecords(batchSendCompany, batchMonthStr);
+      for (const r of attendanceRows) {
+        if (!attendanceByEmployeeId.has(r.employee_id)) {
+          attendanceByEmployeeId.set(r.employee_id, r);
+        }
+      }
+    } catch (e) {
+      console.warn('[SalarySignFill] 拉取考勤表用于 fillData 失败', e);
+    }
+
     const company = companies.find((c) => c.id === batchSendCompany);
     if (!company) {
       toast.error('公司信息无效');
@@ -1234,7 +1252,12 @@ export default function SalarySignaturesPage() {
           fillEmployee: fillEmp,
           companyForFill: companyFill,
           strangers: strang,
-          extraFillData: buildSalaryExtraFillData(unit.source.salaryData),
+          extraFillData: {
+            ...buildSalaryExtraFillData(unit.source.salaryData),
+            ...buildAsignFillDataFromAttendanceRecord(
+              attendanceByEmployeeId.get(unit.source.employee_id) ?? null,
+            ),
+          },
           contractNoNonce: `sx${idx}`,
           displayName,
           userId,
@@ -1272,7 +1295,12 @@ export default function SalarySignaturesPage() {
           asignRaw: result.asign,
           asignTemplateHints: result.asignTemplateHints,
           companyFill,
-          extraFillData: buildSalaryExtraFillData(unit.source.salaryData),
+          extraFillData: {
+            ...buildSalaryExtraFillData(unit.source.salaryData),
+            ...buildAsignFillDataFromAttendanceRecord(
+              attendanceByEmployeeId.get(unit.source.employee_id) ?? null,
+            ),
+          },
         });
         setBatchSendProgress({ current: idx, total: workUnits.length });
       }

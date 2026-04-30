@@ -8,6 +8,8 @@
  * - 乙方：与「个人」同义，部分合同模板 dataKey 写作乙方
  */
 
+import type { AttendanceRecord } from '@/types/types';
+
 export type AsignContractFillCompany = {
   name: string;
   code: string;
@@ -35,12 +37,96 @@ export type AsignContractFillEmployee = {
   insurance_start_date?: string;
 };
 
+export type AsignAttendanceFillSource = Pick<
+  AttendanceRecord,
+  'month' | 'work_days' | 'absent_days' | 'late_times' | 'leave_days' | 'overtime_hours' | 'remarks'
+>;
+
 export type BuildAsignFillDataOptions = {
   /**
    * 为 true 时去掉值为空字符串的键（减轻爱签侧解析压力；若模板要求「键必须存在」请保持 false）
    */
   omitEmptyStringValues?: boolean;
+  /**
+   * 员工考勤表（attendance_records）一条记录，与考勤 Excel / 控制台 dataKey 对齐
+   */
+  attendanceRecord?: AsignAttendanceFillSource | null;
 };
+
+function formatAttendanceFieldValue(n: unknown): string {
+  if (n === null || n === undefined) {
+    return '';
+  }
+  if (typeof n === 'number') {
+    if (!Number.isFinite(n)) {
+      return '';
+    }
+    return String(n);
+  }
+  return String(n).trim();
+}
+
+/**
+ * 从「员工考勤表」一条记录生成 fillData 片段（含 `{{键}}` 变体，与 buildSalaryExtraFillData 一致）。
+ */
+export function buildAsignFillDataFromAttendanceRecord(
+  record: AsignAttendanceFillSource | null | undefined,
+): Record<string, string> {
+  if (!record) {
+    return {};
+  }
+  const out: Record<string, string> = {};
+  const add = (key: string, value: string) => {
+    out[key] = value;
+    out[`{{${key}}}`] = value;
+  };
+
+  const month = (record.month || '').trim();
+  const workDays = formatAttendanceFieldValue(record.work_days);
+  const absentDays = formatAttendanceFieldValue(record.absent_days);
+  const lateTimes = formatAttendanceFieldValue(record.late_times);
+  const leaveDays = formatAttendanceFieldValue(record.leave_days);
+  const overtimeHours = formatAttendanceFieldValue(record.overtime_hours);
+  const remarks = (record.remarks ?? '').trim();
+
+  add('月份', month);
+  add('考勤月份', month);
+  add('出勤天数', workDays);
+  add('缺勤天数', absentDays);
+  add('迟到次数', lateTimes);
+  add('请假天数', leaveDays);
+  add('加班小时', overtimeHours);
+  add('备注', remarks);
+
+  add('work_days', workDays);
+  add('absent_days', absentDays);
+  add('late_times', lateTimes);
+  add('leave_days', leaveDays);
+  add('overtime_hours', overtimeHours);
+  add('remarks', remarks);
+
+  return out;
+}
+
+/**
+ * 在多条考勤记录中选一条用于合同填充：优先与合同开始日同月（YYYY-MM），否则取列表首条（调用方宜已按月份倒序）。
+ */
+export function pickAttendanceRecordForContractFill(
+  rows: AttendanceRecord[],
+  contractStartDate?: string,
+): AttendanceRecord | null {
+  if (!rows.length) {
+    return null;
+  }
+  const start = (contractStartDate || '').trim().slice(0, 7);
+  if (start.length === 7 && start[4] === '-') {
+    const hit = rows.find((r) => (r.month || '').trim() === start);
+    if (hit) {
+      return hit;
+    }
+  }
+  return rows[0];
+}
 
 export function buildAsignFillDataForContract(
   employeeData: AsignContractFillEmployee,
@@ -152,6 +238,11 @@ export function buildAsignFillDataForContract(
   for (const [k, v] of Object.entries(core)) {
     put(k, v);
     put(`{{${k}}}`, v);
+  }
+
+  const attendanceFill = buildAsignFillDataFromAttendanceRecord(options?.attendanceRecord ?? null);
+  for (const [k, v] of Object.entries(attendanceFill)) {
+    put(k, v);
   }
 
   return out;

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import { MainLayout } from '@/components/layouts/MainLayout';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -46,13 +46,10 @@ import {
   deleteAttendanceRecord,
   deleteAttendanceRecordsBatch,
   getCompanies,
-  getEmployees,
   getEmployeesByCompany,
   getCurrentUserPermissions,
-  updateAttendanceRecord
 } from '@/db/api';
-import { generateAttendanceRecordPDF, uploadPDFToStorage } from '@/utils/pdfGenerator';
-import type { AttendanceRecord, Company, Employee } from '@/types/types';
+import type { AttendanceRecord, Company } from '@/types/types';
 import * as XLSX from 'xlsx';
 import { Skeleton } from '@/components/ui/skeleton';
 
@@ -62,11 +59,15 @@ export default function AttendancePage() {
   const [loading, setLoading] = useState(true);
   const [records, setRecords] = useState<AttendanceRecord[]>([]);
   const [companies, setCompanies] = useState<Company[]>([]);
-  const [employees, setEmployees] = useState<Employee[]>([]);
   const [selectedCompanyId, setSelectedCompanyId] = useState<string>('');
   const [selectedMonth, setSelectedMonth] = useState<string>('');
   const [searchKeyword, setSearchKeyword] = useState('');
   const [uploadDialogOpen, setUploadDialogOpen] = useState(false);
+  /** 上传对话框内独立状态，避免与列表筛选共用导致 loadData 重渲染关闭弹层（与工资表页 formData 做法一致） */
+  const [uploadCompanyId, setUploadCompanyId] = useState('');
+  const [uploadDefaultMonth, setUploadDefaultMonth] = useState('');
+  const [uploadSelectedFile, setUploadSelectedFile] = useState<File | null>(null);
+  const uploadFileInputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
   const [permissions, setPermissions] = useState<string[]>([]);
   const [selectedRecords, setSelectedRecords] = useState<string[]>([]);
@@ -85,14 +86,17 @@ export default function AttendancePage() {
   }, [searchParams]);
 
   useEffect(() => {
-    loadData();
+    void loadData();
   }, [selectedCompanyId, selectedMonth]);
 
-  const loadData = async () => {
+  /** filters 用于在上传成功后立即按新公司拉列表，避免 setState 异步导致仍用旧 selectedCompanyId */
+  const loadData = async (filters?: { companyId?: string; month?: string }) => {
+    const companyId = filters?.companyId ?? selectedCompanyId;
+    const month = filters?.month ?? selectedMonth;
     setLoading(true);
     try {
       const [recordsData, companiesData, perms] = await Promise.all([
-        getAttendanceRecords(selectedCompanyId || undefined, selectedMonth || undefined),
+        getAttendanceRecords(companyId || undefined, month || undefined),
         getCompanies(),
         getCurrentUserPermissions()
       ]);
@@ -100,12 +104,6 @@ export default function AttendancePage() {
       setRecords(recordsData);
       setCompanies(companiesData);
       setPermissions(perms);
-
-      // 如果选择了公司，加载该公司的员工
-      if (selectedCompanyId) {
-        const employeesData = await getEmployeesByCompany(selectedCompanyId);
-        setEmployees(employeesData);
-      }
     } catch (error) {
       console.error('加载考勤数据失败:', error);
       alert('加载失败：无法加载考勤数据，请刷新页面重试');
@@ -118,85 +116,37 @@ export default function AttendancePage() {
     return permissions.includes(permission);
   };
 
-  // 后台生成考勤确认表PDF
-  const generateAttendancePDFsInBackground = async (
-    attendanceRecords: AttendanceRecord[],
-    company: Company
-  ) => {
-    let successCount = 0;
-    let failCount = 0;
-
-    for (const record of attendanceRecords) {
-      try {
-        // 获取员工详细信息
-        const employee = employees.find(e => e.id === record.employee_id);
-        
-        if (!employee) {
-          console.warn(`未找到员工信息: ${record.employee_id}`);
-          failCount++;
-          continue;
-        }
-
-        // 解析年月
-        const [year, month] = record.month.split('-').map(Number);
-
-        // 生成PDF
-        const pdfBlob = await generateAttendanceRecordPDF({
-          companyName: company.name,
-          employeeName: employee.name,
-          department: employee.department,
-          position: employee.position,
-          year,
-          month,
-          attendanceData: {
-            work_days: record.work_days,
-            absent_days: record.absent_days,
-            late_count: record.late_times,
-            leave_days: record.leave_days,
-            overtime_hours: record.overtime_hours,
-            notes: record.remarks
-          }
-        });
-
-        // 上传PDF到Storage
-        const fileName = `${company.name}_${employee.name}_${record.month}_考勤确认表_${Date.now()}.pdf`;
-        const pdfUrl = await uploadPDFToStorage(pdfBlob, fileName);
-
-        if (pdfUrl) {
-          // 更新考勤记录，保存PDF URL
-          await updateAttendanceRecord(record.id, { pdf_url: pdfUrl });
-
-          successCount++;
-        } else {
-          failCount++;
-        }
-      } catch (error) {
-        console.error(`生成考勤确认表PDF失败 - ${record.employee_id}:`, error);
-        failCount++;
-      }
+  const resetUploadDialogDraft = () => {
+    setUploadSelectedFile(null);
+    if (uploadFileInputRef.current) {
+      uploadFileInputRef.current.value = '';
     }
-
-    // 显示结果
-    if (failCount === 0) {
-      toast.success(`所有考勤确认表PDF已生成完成（${successCount}个）`);
-    } else {
-      toast.warning(`PDF生成完成：成功${successCount}个，失败${failCount}个`);
-    }
-
-    // 刷新数据
-    loadData();
   };
 
-  // 处理Excel文件上传
-  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
+  const handleUploadDialogOpenChange = (open: boolean) => {
+    setUploadDialogOpen(open);
+    if (!open) {
+      resetUploadDialogDraft();
+    }
+  };
 
-    if (!selectedCompanyId) {
+  const handleUploadFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    setUploadSelectedFile(file ?? null);
+  };
+
+  /** 点击「上传」后解析 Excel 并保存考勤记录 */
+  const submitAttendanceUpload = async () => {
+    if (!uploadCompanyId) {
       alert('请先选择公司再上传考勤表');
       return;
     }
+    if (!uploadSelectedFile) {
+      alert('请先选择 Excel 文件');
+      return;
+    }
 
+    const file = uploadSelectedFile;
     setUploading(true);
 
     try {
@@ -208,7 +158,7 @@ export default function AttendancePage() {
       console.log('解析的Excel数据:', jsonData);
 
       // 获取该公司的所有员工（用于匹配）
-      const companyEmployees = await getEmployeesByCompany(selectedCompanyId);
+      const companyEmployees = await getEmployeesByCompany(uploadCompanyId);
 
       // 解析考勤数据
       const attendanceRecords: Omit<AttendanceRecord, 'id' | 'created_at' | 'updated_at'>[] = [];
@@ -238,7 +188,7 @@ export default function AttendancePage() {
         }
 
         // 提取考勤月份
-        const month = row['月份'] || row['考勤月份'] || row['month'] || selectedMonth;
+        const month = row['月份'] || row['考勤月份'] || row['month'] || uploadDefaultMonth;
         if (!month) {
           console.warn('跳过无效行（缺少月份）:', row);
           continue;
@@ -246,7 +196,7 @@ export default function AttendancePage() {
 
         // 提取考勤数据
         const record: Omit<AttendanceRecord, 'id' | 'created_at' | 'updated_at'> = {
-          company_id: selectedCompanyId,
+          company_id: uploadCompanyId,
           employee_id: employee.id,
           month: month,
           work_days: parseFloat(row['出勤天数'] || row['work_days'] || '0'),
@@ -271,24 +221,15 @@ export default function AttendancePage() {
       const createdRecords = await createAttendanceRecordsBatch(attendanceRecords);
       alert(`上传成功：成功导入 ${createdRecords.length} 条考勤记录`);
 
-      // 获取公司信息
-      const company = companies.find(c => c.id === selectedCompanyId);
-      
-      if (company && createdRecords.length > 0) {
-        // 后台生成PDF（不阻塞用户操作）
-        toast.info('正在后台生成考勤确认表PDF文件，请稍候...');
-        generateAttendancePDFsInBackground(createdRecords, company);
-      }
-
+      setSelectedCompanyId(uploadCompanyId);
+      resetUploadDialogDraft();
       setUploadDialogOpen(false);
-      loadData();
+      await loadData({ companyId: uploadCompanyId, month: selectedMonth });
     } catch (error) {
       console.error('上传考勤表失败:', error);
       alert(`上传失败：${error instanceof Error ? error.message : '上传考勤表时发生错误'}`);
     } finally {
       setUploading(false);
-      // 重置文件输入
-      event.target.value = '';
     }
   };
 
@@ -458,7 +399,14 @@ export default function AttendancePage() {
               <Download className="mr-2 h-4 w-4" />
               下载模板
             </Button>
-            <Button onClick={() => setUploadDialogOpen(true)}>
+            <Button
+              onClick={() => {
+                setUploadCompanyId(selectedCompanyId);
+                setUploadDefaultMonth(selectedMonth);
+                resetUploadDialogDraft();
+                setUploadDialogOpen(true);
+              }}
+            >
               <Upload className="mr-2 h-4 w-4" />
               上传考勤表
             </Button>
@@ -646,55 +594,72 @@ export default function AttendancePage() {
         </Card>
 
         {/* 上传对话框 */}
-        <Dialog open={uploadDialogOpen} onOpenChange={setUploadDialogOpen}>
-          <DialogContent>
+        <Dialog open={uploadDialogOpen} onOpenChange={handleUploadDialogOpenChange}>
+          <DialogContent className="max-w-2xl">
             <DialogHeader>
               <DialogTitle>上传考勤表</DialogTitle>
               <DialogDescription>
                 选择Excel文件上传考勤数据，系统将自动拆分每个员工的考勤记录
               </DialogDescription>
             </DialogHeader>
-            <div className="space-y-4 py-4">
+            <div className="space-y-4">
               <div className="space-y-2">
                 <Label>选择公司 *</Label>
                 <CompanySelector
                   companies={companies}
-                  value={selectedCompanyId}
-                  onValueChange={setSelectedCompanyId}
+                  value={uploadCompanyId}
+                  onValueChange={setUploadCompanyId}
                   placeholder="请选择公司"
                   emptyText="未找到公司"
                   searchPlaceholder="搜索公司名称..."
                 />
               </div>
               <div className="space-y-2">
-                <Label>默认月份（可选）</Label>
+                <Label htmlFor="attendance-upload-default-month">默认月份（可选）</Label>
                 <Input
+                  id="attendance-upload-default-month"
                   type="month"
-                  value={selectedMonth}
-                  onChange={(e) => setSelectedMonth(e.target.value)}
+                  value={uploadDefaultMonth}
+                  onChange={(e) => setUploadDefaultMonth(e.target.value)}
                   placeholder="如Excel中无月份列，使用此默认值"
                 />
               </div>
               <div className="space-y-2">
                 <Label htmlFor="file-upload">选择Excel文件 *</Label>
                 <Input
+                  ref={uploadFileInputRef}
                   id="file-upload"
                   type="file"
                   accept=".xlsx,.xls"
-                  onChange={handleFileUpload}
-                  disabled={uploading || !selectedCompanyId}
+                  onChange={handleUploadFileSelect}
+                  disabled={uploading || !uploadCompanyId}
                 />
+                {uploadSelectedFile ? (
+                  <p className="text-sm text-muted-foreground">已选择：{uploadSelectedFile.name}</p>
+                ) : null}
                 <p className="text-xs text-muted-foreground">
                   支持.xlsx和.xls格式，文件应包含：姓名、月份、出勤天数、缺勤天数、迟到次数、请假天数、加班小时等列
                 </p>
               </div>
             </div>
             <DialogFooter>
-              <Button variant="outline" onClick={() => setUploadDialogOpen(false)} disabled={uploading}>
+              <Button
+                variant="outline"
+                onClick={() => handleUploadDialogOpenChange(false)}
+                disabled={uploading}
+              >
                 取消
               </Button>
-              <Button onClick={openTemplateDialog} variant="secondary">
+              <Button onClick={openTemplateDialog} variant="secondary" type="button" disabled={uploading}>
                 下载模板
+              </Button>
+              <Button
+                type="button"
+                onClick={() => void submitAttendanceUpload()}
+                disabled={uploading || !uploadCompanyId || !uploadSelectedFile}
+              >
+                <Upload className="mr-2 h-4 w-4" />
+                上传
               </Button>
             </DialogFooter>
           </DialogContent>
