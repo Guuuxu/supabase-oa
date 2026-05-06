@@ -1,6 +1,7 @@
 /**
  * 爱签 createContract「templates[].fillData」：key 须与控制台模板控件 dataKey 完全一致。
  * 修改填充字段时只改本文件即可；与 SigningsPage 的 replacePlaceholders 占位符语义尽量对齐。
+ * 薪酬工资条签署：fillData ≈ buildAsignFillDataForContract(员工/公司) + buildSalarySigningPeriodFillData + 工资条 data + 考勤片段（见 SalarySignaturesPage）。
  *
  * 「甲方」「个人」与爱签模板签署位 signKey、以及文书里常见称谓一致：
  * - 甲方：单位（公司）名称，用于甲方抬头/落款类控件
@@ -92,11 +93,19 @@ export function buildAsignFillDataFromAttendanceRecord(
   add('月份', month);
   add('考勤月份', month);
   add('出勤天数', workDays);
+  /** 与 SalarySignaturesPage.buildSalaryExtraFillData 中 ['出勤','出勤天数'] 对齐；爱签模板 dataKey 常写作「出勤」 */
+  add('出勤', workDays);
   add('缺勤天数', absentDays);
   add('迟到次数', lateTimes);
   add('请假天数', leaveDays);
   add('加班小时', overtimeHours);
+  add('加班', overtimeHours);
   add('备注', remarks);
+
+  /** 与工资条页 buildSalaryExtraFillData 的 aliasPairs 中「缺勤/迟到/请假」等写法对齐（考勤表仅有汇总字段） */
+  add('缺勤', absentDays);
+  add('迟到', lateTimes);
+  add('请假', leaveDays);
 
   add('work_days', workDays);
   add('absent_days', absentDays);
@@ -105,6 +114,38 @@ export function buildAsignFillDataFromAttendanceRecord(
   add('overtime_hours', overtimeHours);
   add('remarks', remarks);
 
+  return out;
+}
+
+/**
+ * 工资条/薪酬签署所选「核算年月」写入 fillData，便于模板用独立控件绑定「工资期间」等。
+ * 若控件 dataKey 与下列键不一致，请在爱签控制台改成同名，或在工资条 aliasPairs 中增加映射。
+ */
+export function buildSalarySigningPeriodFillData(year: number, month: number): Record<string, string> {
+  const y = Math.floor(Number(year)) || 0;
+  const mRaw = Math.floor(Number(month)) || 1;
+  const m = Math.min(12, Math.max(1, mRaw));
+  const yyyy = String(y);
+  const mm = String(m).padStart(2, '0');
+  const ym = y > 0 ? `${yyyy}-${mm}` : '';
+  const out: Record<string, string> = {};
+  const put = (key: string, value: string) => {
+    out[key] = value;
+    out[`{{${key}}}`] = value;
+  };
+  if (y > 0) {
+    put('工资年份', yyyy);
+    put('工资月份', String(m));
+    put('工资月', String(m));
+    put('核算月份', ym);
+    put('工资年月', ym);
+    put('工资期间', `${y}年${m}月`);
+    put('薪酬月份', ym);
+    put('year', yyyy);
+    put('month', mm);
+    put('salary_year', yyyy);
+    put('salary_month', mm);
+  }
   return out;
 }
 
@@ -178,11 +219,13 @@ export function buildAsignFillDataForContract(
   const core: Record<string, string> = {
     /** 与 SigningsPage 里甲方 signKey「甲方」对应，供模板文本域 dataKey 使用 */
     甲方: companyName,
-    /** 与乙方/个人签署位 signKey「个人」对应 */
+    /** 与乙方/个人签署位 signKey 对应（主签位优先「乙方」时仍以姓名填充） */
     个人: employeeName,
     /** 劳动/协议类模板常见「乙方」dataKey */
     乙方: employeeName,
     员工姓名: employeeName,
+    员工: employeeName,
+    姓名: employeeName,
     性别:  (employeeData.gender || '').trim(),
     身份证号: (employeeData.id_card || '').trim(),
     手机号: (employeeData.phone || '').trim(),

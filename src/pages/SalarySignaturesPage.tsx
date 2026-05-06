@@ -81,7 +81,7 @@ import type {
   Employee,
 } from '@/types/types';
 import type { AsignContractFillCompany, AsignContractFillEmployee } from '@/utils/asignFillData';
-import { buildAsignFillDataFromAttendanceRecord } from '@/utils/asignFillData';
+import { buildAsignFillDataFromAttendanceRecord, buildSalarySigningPeriodFillData } from '@/utils/asignFillData';
 import {
   extractAsignCreateContractPreviewUrl,
   buildAsignStrangersForSalarySigning,
@@ -90,6 +90,7 @@ import {
 import {
   extractAsignTemplateControlHints,
   mergeTemplateDateSignKeysForAddSigner,
+  pickAsignPartyBMainSignKey,
   type AsignTemplateControlHints,
 } from '@/utils/extractAsignTemplateControlHints';
 import { SALARY_SIGNATURE_STATUS_LABELS, ATTENDANCE_SIGNATURE_STATUS_LABELS } from '@/types/types';
@@ -145,10 +146,19 @@ function toAsignFillString(v: unknown): string {
   return String(v).trim();
 }
 
+/**
+ * 工资条 `item.data` → 爱签 fillData 的「金额与工资项」片段（不含员工/公司主体字段，由 invoke 内 buildAsignFillDataForContract 合并）。
+ *
+ * 带入规则（按优先级）：
+ * 1. **原样写入**：`data` 里每个键都会写入（含 `{{键}}` 变体）。上传工资表时写入的是工资结构里的 **field.code**，故爱签控件 dataKey 与 code 一致时无需配置即可带入。
+ * 2. **别名 aliasPairs**：模板 dataKey 与 Excel/code 不一致时，增加一行 `[ '爱签上的键', '工资条里已有的键' ]`；单向 `[ '键' ]` 仅当两名称相同才生效。
+ * 3. **考勤**：`出勤/缺勤/迟到…` 等汇总项由 `buildAsignFillDataFromAttendanceRecord` 在页面里与本结果合并；库表无字段的项（如旷工天数）仍须出现在工资条 `data` 或别名字段中。
+ *
+ * 本函数返回值会作为 `invokeAsignTemplateCreateSigning` 的 `extraFillData` 与员工/公司 fill 合并进 `fillData`（见 `asignSalaryInvokeCreateSigning.ts`）。`aliasPairs` 中若工资条无对应列，仍会写入该键（空字符串），以免爱签报缺键；非空值由考勤或工资条其它列覆盖。
+ */
 function buildSalaryExtraFillData(data: Record<string, number | string> | undefined): Record<string, string> {
-  if (!data) {
-    return {};
-  }
+  /** 无工资条 data 时仍参与别名占位，便于与考勤/期间 fill 合并后爱签能收到完整键名 */
+  const row = data ?? {};
   const out: Record<string, string> = {};
   const add = (key: string, value: unknown) => {
     const normalized = toAsignFillString(value);
@@ -156,28 +166,42 @@ function buildSalaryExtraFillData(data: Record<string, number | string> | undefi
     out[`{{${key}}}`] = normalized;
   };
 
-  for (const [k, v] of Object.entries(data)) {
+  for (const [k, v] of Object.entries(row)) {
     add(k, v);
   }
 
   const aliasPairs: Array<[string, string] | [string]> = [
-    ['base_salary', '基本工资'],
+    ['出勤工资', '基本工资'],
     ['position_salary', '岗位工资'],
-    ['performance_bonus', '绩效奖金'],
-    ['attendance_bonus', '全勤奖'],
-    ['overtime_pay', '加班费'],
-    ['transport_allowance', '交通补贴'],
-    ['meal_allowance', '餐补'],
-    ['communication_allowance', '通讯补贴'],
-    ['gross_salary', '应发工资'],
-    ['social_insurance_personal', '社保个人部分'],
-    ['housing_fund_personal', '公积金个人部分'],
-    ['personal_income_tax', '个人所得税'],
-    ['other_deductions', '其他扣款'],
-    ['net_salary', '实发工资'],
+    ['绩效工资', '绩效奖金'],
+    [ '年休假工资'],
+    ['平时加班工资', '加班费'],
+    ['周末加班工资', '周末加班费'],
+    ['节假日加班工资', '节假日加班费'],
+    ['交通补贴', '交通补贴'],
+    ['餐补', '餐补'],
+    ['通讯补贴', '通讯补贴'],
+    ['应发工资', '应发合计'],
+    ['经济补偿金'],
+    [ '社会保险补贴'],
+    ['公积金补贴'],
+    ['高温低温补贴'],
+    ['保密补贴'],
+    ['竞业补贴'],
+    ['岗位补贴'],
+    ['失业待遇补贴'],
+    ['住房扣款', '住房扣款'],
+    ['伙食扣款'],
+    ['借款抵扣'],
+    ['社保个人部分','个人社会保险扣款'],
+    ['公积金个人部分','个人公积金扣款'],
+    ['个人所得税', '个人所得税扣款'],
+    ['预支工资'],
+    ['个人借款'],
+    ['其它扣除', '其他扣除'],
+    ['应扣合计'],
+    ['实发工资', '实发工资'],
     ['出勤', '出勤天数'],
-    ['平时加班', '平时加班费'],
-    ['周末加班', '周末加班费'],
     ['缺勤天数', '缺勤'],
     ['节假日加班', '节假日加班费'],
     ['迟到', '迟到次数'],
@@ -196,46 +220,47 @@ function buildSalaryExtraFillData(data: Record<string, number | string> | undefi
     ['备注']
   ];
 
-  for (const [code, label] of aliasPairs) {
-    const codeValue = data[code];
-    const labelValue = data[label];
+  for (const pair of aliasPairs) {
+    const code = pair[0];
+    if (code === undefined || code === '') {
+      continue;
+    }
+    const label = pair.length >= 2 && pair[1] !== undefined ? pair[1] : code;
+    const codeValue = row[code];
+    const labelValue = row[label];
     if (codeValue !== undefined) {
       add(code, codeValue);
-      add(label, codeValue);
+      if (label !== code) {
+        add(label, codeValue);
+      }
     } else if (labelValue !== undefined) {
       add(code, labelValue);
-      add(label, labelValue);
+      if (label !== code) {
+        add(label, labelValue);
+      }
+    } else {
+      /** 工资条中无对应列时仍写入键（空串），避免爱签报「缺少模板参数」；后续 extraFillData 里考勤/期间可覆盖 */
+      if (!(code in out)) {
+        add(code, '');
+      }
+      if (label !== code && !(label in out)) {
+        add(label, '');
+      }
     }
   }
 
-  const socialValue = data.social_insurance_personal ?? data['社保个人部分'] ?? data['社保个人'];
+  const socialValue = row.social_insurance_personal ?? row['社保个人部分'] ?? row['社保个人'];
   if (socialValue !== undefined) {
     add('社保个人', socialValue);
     add('社保个人部分', socialValue);
-    add('social_insurance_personal', socialValue);
   }
-  const housingValue = data.housing_fund_personal ?? data['公积金个人部分'] ?? data['公积金个人'];
+  const housingValue = row.housing_fund_personal ?? row['公积金个人部分'] ?? row['公积金个人'];
   if (housingValue !== undefined) {
     add('公积金个人', housingValue);
     add('公积金个人部分', housingValue);
-    add('housing_fund_personal', housingValue);
   }
 
   return out;
-}
-
-/**
- * 薪酬模板常见仅有「个人」或「乙方」签署位（无甲方企业章场景居多），优先匹配「个人」（与常见工资条/确认书控件一致）。
- */
-function pickSalaryPartyBMainSignKey(signKeys: string[]): string | null {
-  const set = new Set(signKeys.map((s) => s.trim()).filter(Boolean));
-  const order = ['个人', '乙方', '员工', '员工签字', '乙方签字'] as const;
-  for (const k of order) {
-    if (set.has(k)) {
-      return k;
-    }
-  }
-  return null;
 }
 
 export default function SalarySignaturesPage() {
@@ -1253,6 +1278,7 @@ export default function SalarySignaturesPage() {
           companyForFill: companyFill,
           strangers: strang,
           extraFillData: {
+            ...buildSalarySigningPeriodFillData(year, month),
             ...buildSalaryExtraFillData(unit.source.salaryData),
             ...buildAsignFillDataFromAttendanceRecord(
               attendanceByEmployeeId.get(unit.source.employee_id) ?? null,
@@ -1296,6 +1322,7 @@ export default function SalarySignaturesPage() {
           asignTemplateHints: result.asignTemplateHints,
           companyFill,
           extraFillData: {
+            ...buildSalarySigningPeriodFillData(year, month),
             ...buildSalaryExtraFillData(unit.source.salaryData),
             ...buildAsignFillDataFromAttendanceRecord(
               attendanceByEmployeeId.get(unit.source.employee_id) ?? null,
@@ -1397,20 +1424,20 @@ export default function SalarySignaturesPage() {
         const signKeysArr = hints.signKeys.map((s) => s.trim()).filter(Boolean);
         const signKeySet = new Set(signKeysArr);
 
-        let mainBSignKey = pickSalaryPartyBMainSignKey(signKeysArr);
+        let mainBSignKey = pickAsignPartyBMainSignKey(signKeysArr);
         let useTemplateSignKeysForEmployee = signKeysArr.length > 0 && Boolean(mainBSignKey);
 
         if (!mainBSignKey) {
           const envMain = String(import.meta.env.VITE_ASIGN_SALARY_MAIN_SIGN_KEY ?? '').trim();
-          if (envMain === '乙方' || envMain === '个人') {
+          if (signKeysArr.length === 0) {
+            mainBSignKey = envMain || '个人';
+            useTemplateSignKeysForEmployee = false;
+          } else if (envMain && signKeySet.has(envMain)) {
             mainBSignKey = envMain;
-            useTemplateSignKeysForEmployee = false;
-          } else if (signKeysArr.length === 0) {
-            mainBSignKey = '个人';
-            useTemplateSignKeysForEmployee = false;
+            useTemplateSignKeysForEmployee = true;
           } else {
             throw new Error(
-              `爱签模板中未找到薪酬常用签署位（乙方/个人）。请在爱签控制台核对签署位 dataKey，或在前端环境变量 VITE_ASIGN_SALARY_MAIN_SIGN_KEY 中指定「乙方」或「个人」。当前解析到的签署位：${signKeysArr.join('、') || '（无）'}`,
+              `爱签 addSigner 要求 signKey 与模板签署控件 dataKey 完全一致；当前模板中不存在「个人」。解析到的签署位：${signKeysArr.join('、')}。请在 .env 设置 VITE_ASIGN_SALARY_MAIN_SIGN_KEY 为上述之一，或在爱签控制台将员工签署位 dataKey 改为「个人」/「乙方」等常见名。`,
             );
           }
         }

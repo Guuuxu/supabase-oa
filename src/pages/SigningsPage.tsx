@@ -2790,7 +2790,7 @@ export default function SigningsPage() {
       const mainB = pickAsignPartyBMainSignKey(hints.signKeys);
       if (!mainB) {
         throw new Error(
-          `爱签模板中未找到个人签署位（依次尝试：个人、乙方、员工等）。模板签署位：${hints.signKeys.join('、')}`,
+          `爱签模板中未找到个人签署位（依次尝试：乙方、个人、员工等）。模板签署位：${hints.signKeys.join('、')}`,
         );
       }
       const dateKeysOrdered = mergeTemplateDateSignKeysForAddSigner({

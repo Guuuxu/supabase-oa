@@ -89,15 +89,45 @@ function walk(
   for (const v of Object.values(o)) walk(v, depth + 1, fillSet, signSet, timestampSet);
 }
 
-/** 个人侧主签署位关键字：按常见模板顺序匹配 */
-const PARTY_B_MAIN_SIGN_KEY_CANDIDATES = ['个人', '乙方', '员工', '员工签字', '乙方签字'] as const;
+/**
+ * 个人侧主签署位：与文书签署（SigningsPage）一致，**同一模板同时存在「乙方」「个人」时优先乙方**，
+ * 避免薪酬批量 addSigner 选到「个人」而单独发起已习惯用「乙方」。
+ */
+const PARTY_B_MAIN_SIGN_KEY_CANDIDATES = ['乙方', '个人', '员工', '员工签字', '乙方签字'] as const;
+const PARTY_B_MAIN_SIGN_KEY_EXTRA = [
+  '劳动者',
+  '受雇方',
+  '签字人',
+  '乙方签字',
+  '员工签名',
+  '签字',
+] as const;
 
 export function pickAsignPartyBMainSignKey(signKeys: string[]): string | null {
-  const set = new Set(signKeys.map((s) => s.trim()).filter(Boolean));
+  const trimmed = signKeys.map((s) => s.trim()).filter(Boolean);
+  const set = new Set(trimmed);
   for (const k of PARTY_B_MAIN_SIGN_KEY_CANDIDATES) {
     if (set.has(k)) {
       return k;
     }
+  }
+  for (const k of PARTY_B_MAIN_SIGN_KEY_EXTRA) {
+    if (set.has(k)) {
+      return k;
+    }
+  }
+  const fuzzy = /^(乙方|个人|员工|劳动者|受雇方|签字人|乙方签字|员工签字|员工签名)$/;
+  for (const k of trimmed) {
+    if (k === '甲方') {
+      continue;
+    }
+    if (fuzzy.test(k)) {
+      return k;
+    }
+  }
+  const nonPartyA = trimmed.filter((k) => k !== '甲方');
+  if (nonPartyA.length === 1) {
+    return nonPartyA[0];
   }
   return null;
 }

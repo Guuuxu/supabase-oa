@@ -16,7 +16,7 @@ interface ImportMetaEnv {
    */
   readonly VITE_ASIGN_PARTY_B_EXTRA_SIGN_KEYS?: string;
   /**
-   * 薪酬签署 addSigner：当 create-signing 返回体解析不到签署位时，指定员工主签署位 signKey，须与控制台一致，常用「个人」或「乙方」。
+   * 薪酬签署 addSigner：须与模板签署控件 dataKey 完全一致；与解析结果不一致时可覆盖。常用「乙方」或「个人」（与 extractAsignTemplateControlHints 候选顺序一致时优先乙方）。
    */
   readonly VITE_ASIGN_SALARY_MAIN_SIGN_KEY?: string;
 }
