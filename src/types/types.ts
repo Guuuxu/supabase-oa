@@ -38,6 +38,10 @@ export interface Company {
   region?: string; // 所在地域
   employee_scale?: string; // 员工规模
   payday_date?: number | null;
+  /** 基本薪资（元），可选 */
+  base_salary?: number | null;
+  /** 社保补贴（元），可选 */
+  social_insurance_subsidy?: number | null;
   created_by: string; // 创建者ID
   owner_id: string; // 当前所有者ID
   created_at: string;

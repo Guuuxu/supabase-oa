@@ -19,6 +19,8 @@ export type AsignContractFillCompany = {
   contact_phone: string;
   legal_representative: string;
   payday_date: string | number;
+  base_salary: number | null;
+  social_insurance_subsidy: number | null;
 };
 
 export type AsignContractFillEmployee = {
@@ -242,6 +244,7 @@ export function buildAsignFillDataForContract(
     合同结束月份: contractEndDateMonth,
     合同结束日: contractEndDateDay,
     地址: (employeeData.address || '').trim(),
+    工作城市: (companyData.region || '').trim(),
     证件类型: (employeeData.id_card_type || '').trim(),
     出生日期: (employeeData.birth_date || '').trim(),
     参保时间: (employeeData.insurance_start_date || '').trim(),
@@ -254,6 +257,8 @@ export function buildAsignFillDataForContract(
     联系人: (companyData.contact_person || '').trim(),
     联系电话: (companyData.contact_phone || '').trim(),
     法定代表人: (companyData.legal_representative || '').trim(),
+    基本薪资: String(companyData.base_salary || ''),
+    社保补贴: String(companyData.social_insurance_subsidy || ''),
     发薪日: String(paydayDate),
     日期: currentDateIso,
     日期文本: currentDateCn,

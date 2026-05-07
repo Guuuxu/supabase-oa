@@ -89,7 +89,9 @@ export default function CompaniesPage() {
     industry: '其他',
     region: '武汉市',
     employee_scale: '小于10人',
-    payday_date: null as number | null
+    payday_date: null as number | null,
+    base_salary: null as number | null,
+    social_insurance_subsidy: null as number | null
   });
 
   useEffect(() => {
@@ -303,7 +305,12 @@ export default function CompaniesPage() {
         industry: company.industry || '其他',
         region: company.region || '武汉市',
         employee_scale: company.employee_scale || '小于10人',
-        payday_date: company.payday_date || 1
+        payday_date: company.payday_date || 1,
+        base_salary: company.base_salary != null ? Number(company.base_salary) : null,
+        social_insurance_subsidy:
+          company.social_insurance_subsidy != null
+            ? Number(company.social_insurance_subsidy)
+            : null
       });
     } else {
       setEditingCompany(null);
@@ -323,7 +330,9 @@ export default function CompaniesPage() {
         industry: '其他',
         region: '武汉市',
         employee_scale: '小于10人',
-        payday_date: 1 // 默认为每月1号
+        payday_date: 1, // 默认为每月1号
+        base_salary: null,
+        social_insurance_subsidy: null
       });
     }
     setDialogOpen(true);
@@ -346,6 +355,20 @@ export default function CompaniesPage() {
     if (formData.payday_date < 1 || formData.payday_date > 31) {
       toast.error('发薪日期必须在1-31之间');
       return;
+    }
+
+    if (formData.base_salary != null) {
+      if (Number.isNaN(formData.base_salary) || formData.base_salary < 0) {
+        toast.error('基本薪资须为非负数');
+        return;
+      }
+    }
+
+    if (formData.social_insurance_subsidy != null) {
+      if (Number.isNaN(formData.social_insurance_subsidy) || formData.social_insurance_subsidy < 0) {
+        toast.error('社保补贴须为非负数');
+        return;
+      }
     }
 
     // 验证联系电话格式（简单验证：11位数字）
@@ -695,6 +718,54 @@ export default function CompaniesPage() {
                         <span className="text-sm text-muted-foreground">号</span>
                       </div>
                       <p className="text-xs text-muted-foreground">设置每月固定发薪日期（1-31号）</p>
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label htmlFor="base_salary" className="text-sm">基本薪资（元）</Label>
+                      <Input
+                        id="base_salary"
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        placeholder="选填"
+                        value={formData.base_salary ?? ''}
+                        onChange={(e) => {
+                          const value = e.target.value;
+                          if (value === '') {
+                            setFormData({ ...formData, base_salary: null });
+                            return;
+                          }
+                          const num = parseFloat(value);
+                          if (!Number.isNaN(num)) {
+                            setFormData({ ...formData, base_salary: num });
+                          }
+                        }}
+                        className="h-9"
+                      />
+                      <p className="text-xs text-muted-foreground">未填写表示未设置参考基本薪资</p>
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label htmlFor="social_insurance_subsidy" className="text-sm">社保补贴（元）</Label>
+                      <Input
+                        id="social_insurance_subsidy"
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        placeholder="选填，如 500"
+                        value={formData.social_insurance_subsidy ?? ''}
+                        onChange={(e) => {
+                          const value = e.target.value;
+                          if (value === '') {
+                            setFormData({ ...formData, social_insurance_subsidy: null });
+                            return;
+                          }
+                          const num = parseFloat(value);
+                          if (!Number.isNaN(num)) {
+                            setFormData({ ...formData, social_insurance_subsidy: num });
+                          }
+                        }}
+                        className="h-9"
+                      />
+                      <p className="text-xs text-muted-foreground">未填写表示暂无补贴</p>
                     </div>
                   </div>
 

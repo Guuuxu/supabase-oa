@@ -2,7 +2,8 @@
 /**
  * 爱签相关环境变量（Deno.env，本地写在 supabase/functions/.env）：
  * - ASIGN_PRIVATE_KEY / ASIGN_APP_ID / ASIGN_BASE_URL
- * - ASIGN_NOTIFY_URL / ASIGN_CALLBACK_URL / ASIGN_REDIRECT_URL（公网 HTTPS；createContract 的 bizData）
+ * - ASIGN_NOTIFY_URL / ASIGN_CALLBACK_URL（公网 HTTPS；createContract 的 bizData）
+ * - createContract 默认不传 redirectUrl（不配置签署完成后的页面跳转）；仅当请求体含非空 redirectUrl 时写入 bizData
  * - ASIGN_SIGN_HASH：SHA256（默认）或 SHA1 → 见 _shared/asign-client.ts
  * - ASIGN_SIGN_PLAINTEXT_MODE：kv_sorted（默认）或 bizdata_only 等
  * - contractFileStorage 模式需 SUPABASE_SERVICE_ROLE_KEY（仅用下载暂存 PDF，不参与爱签）
@@ -163,12 +164,17 @@ function strangerToBizData(s: CreateSigningStranger): Record<string, unknown> {
   return row;
 }
 
+/** 仅当调用方显式传入非空 redirectUrl 时使用；不再回退 ASIGN_REDIRECT_URL，避免签署完成后跳转 */
+function explicitRedirectUrl(body: CreateSigningBody): string | undefined {
+  const s = typeof body.redirectUrl === "string" ? body.redirectUrl.trim() : "";
+  return s || undefined;
+}
+
 function bizDataRecordLikeNodeDemo(body: CreateSigningBody): Record<string, unknown> {
   const raw: Record<string, unknown> = {
     validityTime: body.validityTime ?? 30,
     autoContinue: body.autoContinue ?? 0,
     readSeconds: body.readSeconds ?? 2,
-    redirectUrl: body.redirectUrl ?? Deno.env.get("ASIGN_REDIRECT_URL") ?? "",
     refuseOn: body.refuseOn ?? 0,
     contractNo: body.contractNo,
     notifyUrl: body.notifyUrl ?? Deno.env.get("ASIGN_NOTIFY_URL") ?? "",
@@ -177,6 +183,10 @@ function bizDataRecordLikeNodeDemo(body: CreateSigningBody): Record<string, unkn
     needAgree: body.needAgree ?? 0,
     signOrder: body.signOrder ?? 1,
   };
+  const redirect = explicitRedirectUrl(body);
+  if (redirect) {
+    raw.redirectUrl = redirect;
+  }
   if (Array.isArray(body.templates) && body.templates.length > 0) {
     raw.templates = body.templates;
   }
@@ -221,7 +231,6 @@ async function callAsignCreateContract(body: CreateSigningBody) {
     validityTime: body.validityTime ?? 30,
     autoContinue: body.autoContinue ?? 0,
     readSeconds: body.readSeconds ?? 2,
-    redirectUrl: body.redirectUrl ?? Deno.env.get("ASIGN_REDIRECT_URL") ?? "",
     refuseOn: body.refuseOn ?? 0,
     contractNo: body.contractNo,
     notifyUrl: body.notifyUrl ?? Deno.env.get("ASIGN_NOTIFY_URL") ?? "",
@@ -230,6 +239,10 @@ async function callAsignCreateContract(body: CreateSigningBody) {
     needAgree: body.needAgree ?? 0,
     signOrder: body.signOrder ?? 1,
   };
+  const redirect = explicitRedirectUrl(body);
+  if (redirect) {
+    bizDataInput.redirectUrl = redirect;
+  }
   if (Array.isArray(body.templates) && body.templates.length > 0) {
     bizDataInput.templates = body.templates;
   }
@@ -237,7 +250,7 @@ async function callAsignCreateContract(body: CreateSigningBody) {
   return callAsignFormPost({
     path: "contract/createContract",
     bizDataInput,
-    keepEmptyStringKeys: ["redirectUrl", "notifyUrl", "callbackUrl"],
+    keepEmptyStringKeys: ["notifyUrl", "callbackUrl"],
     strictBizDataOverride: bizDataRecordLikeNodeDemo(body),
     contractFiles: body.contractFiles?.length ? body.contractFiles : undefined,
   });

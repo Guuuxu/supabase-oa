@@ -683,6 +683,18 @@ export async function createCompany(company: Omit<Company, 'id' | 'created_at' |
     address: company.address || null,
     service_start_date: company.service_start_date || null,
     service_end_date: company.service_end_date || null,
+    base_salary: (() => {
+      const v = company.base_salary;
+      if (v == null) return null;
+      const n = Number(v);
+      return Number.isNaN(n) ? null : n;
+    })(),
+    social_insurance_subsidy: (() => {
+      const v = company.social_insurance_subsidy;
+      if (v == null) return null;
+      const n = Number(v);
+      return Number.isNaN(n) ? null : n;
+    })(),
     created_by: user.id, // 自动添加创建者ID
     owner_id: user.id, // 自动添加所有者ID（默认为创建者）
   };
@@ -732,6 +744,24 @@ export async function updateCompany(id: string, updates: Partial<Company>): Prom
   }
   if ('service_end_date' in cleanedUpdates) {
     cleanedUpdates.service_end_date = cleanedUpdates.service_end_date || null;
+  }
+  if ('base_salary' in cleanedUpdates) {
+    const v = cleanedUpdates.base_salary;
+    if (v === '' || v === undefined || v === null) {
+      cleanedUpdates.base_salary = null;
+    } else {
+      const n = Number(v);
+      cleanedUpdates.base_salary = Number.isNaN(n) ? null : n;
+    }
+  }
+  if ('social_insurance_subsidy' in cleanedUpdates) {
+    const v = cleanedUpdates.social_insurance_subsidy;
+    if (v === '' || v === undefined || v === null) {
+      cleanedUpdates.social_insurance_subsidy = null;
+    } else {
+      const n = Number(v);
+      cleanedUpdates.social_insurance_subsidy = Number.isNaN(n) ? null : n;
+    }
   }
 
   console.log('准备更新公司，ID:', id, '数据:', cleanedUpdates);

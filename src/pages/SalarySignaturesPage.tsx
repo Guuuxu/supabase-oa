@@ -79,6 +79,7 @@ import type {
   SalarySignatureType,
   DocumentTemplate,
   Employee,
+  SalaryStructureField,
 } from '@/types/types';
 import type { AsignContractFillCompany, AsignContractFillEmployee } from '@/utils/asignFillData';
 import { buildAsignFillDataFromAttendanceRecord, buildSalarySigningPeriodFillData } from '@/utils/asignFillData';
@@ -155,8 +156,13 @@ function toAsignFillString(v: unknown): string {
  * 3. **考勤**：`出勤/缺勤/迟到…` 等汇总项由 `buildAsignFillDataFromAttendanceRecord` 在页面里与本结果合并；库表无字段的项（如旷工天数）仍须出现在工资条 `data` 或别名字段中。
  *
  * 本函数返回值会作为 `invokeAsignTemplateCreateSigning` 的 `extraFillData` 与员工/公司 fill 合并进 `fillData`（见 `asignSalaryInvokeCreateSigning.ts`）。`aliasPairs` 中若工资条无对应列，仍会写入该键（空字符串），以免爱签报缺键；非空值由考勤或工资条其它列覆盖。
+ *
+ * `structureFields`：当前工资记录使用的 `salary_structure_templates.fields`。上传工资表时 `data` 的键多为 **field.code**，爱签控件 dataKey 常为 **field.name**（中文），传入后会把同一数值同时写入 name 与 code，避免预览空白。
  */
-function buildSalaryExtraFillData(data: Record<string, number | string> | undefined): Record<string, string> {
+function buildSalaryExtraFillData(
+  data: Record<string, number | string> | undefined,
+  structureFields?: SalaryStructureField[] | null,
+): Record<string, string> {
   /** 无工资条 data 时仍参与别名占位，便于与考勤/期间 fill 合并后爱签能收到完整键名 */
   const row = data ?? {};
   const out: Record<string, string> = {};
@@ -245,6 +251,32 @@ function buildSalaryExtraFillData(data: Record<string, number | string> | undefi
       }
       if (label !== code && !(label in out)) {
         add(label, '');
+      }
+    }
+  }
+
+  /** 按工资结构模板定义，把 row[code] 同步到爱签常用的中文 dataKey（field.name） */
+  if (Array.isArray(structureFields) && structureFields.length > 0) {
+    for (const f of structureFields) {
+      const name = (f.name || '').trim();
+      const code = (f.code || '').trim();
+      if (!name && !code) {
+        continue;
+      }
+      let picked: number | string | undefined;
+      if (code && row[code] !== undefined && row[code] !== null && row[code] !== '') {
+        picked = row[code] as number | string;
+      } else if (name && row[name] !== undefined && row[name] !== null && row[name] !== '') {
+        picked = row[name] as number | string;
+      }
+      if (picked === undefined) {
+        continue;
+      }
+      if (name) {
+        add(name, picked);
+      }
+      if (code && code !== name) {
+        add(code, picked);
       }
     }
   }
@@ -1130,6 +1162,7 @@ export default function SalarySignaturesPage() {
       type: SalarySignatureType;
       reference_id: string;
       salaryData?: Record<string, number | string>;
+      structureFields?: SalaryStructureField[];
     }> = [];
     const sourceKeySet = new Set<string>();
 
@@ -1144,11 +1177,14 @@ export default function SalarySignaturesPage() {
         if (sourceKeySet.has(key)) {
           continue;
         }
+        const fields = record.template?.fields;
+        const structureFields = Array.isArray(fields) ? fields : undefined;
         sourceUnits.push({
           employee_id: item.employee_id,
           type: 'salary_slip',
           reference_id: record.id,
           salaryData: item.data,
+          structureFields,
         });
         sourceKeySet.add(key);
       }
@@ -1202,6 +1238,7 @@ export default function SalarySignaturesPage() {
         type: SalarySignatureType;
         reference_id: string;
         salaryData?: Record<string, number | string>;
+        structureFields?: SalaryStructureField[];
       };
       template: DocumentTemplate;
     };
@@ -1279,7 +1316,7 @@ export default function SalarySignaturesPage() {
           strangers: strang,
           extraFillData: {
             ...buildSalarySigningPeriodFillData(year, month),
-            ...buildSalaryExtraFillData(unit.source.salaryData),
+            ...buildSalaryExtraFillData(unit.source.salaryData, unit.source.structureFields),
             ...buildAsignFillDataFromAttendanceRecord(
               attendanceByEmployeeId.get(unit.source.employee_id) ?? null,
             ),
@@ -1323,7 +1360,7 @@ export default function SalarySignaturesPage() {
           companyFill,
           extraFillData: {
             ...buildSalarySigningPeriodFillData(year, month),
-            ...buildSalaryExtraFillData(unit.source.salaryData),
+            ...buildSalaryExtraFillData(unit.source.salaryData, unit.source.structureFields),
             ...buildAsignFillDataFromAttendanceRecord(
               attendanceByEmployeeId.get(unit.source.employee_id) ?? null,
             ),
