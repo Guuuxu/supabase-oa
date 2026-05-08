@@ -197,6 +197,8 @@ export default function SigningsPage() {
   const [pendingElectronicSigningDraft, setPendingElectronicSigningDraft] =
     useState<PendingElectronicSigningDraft | null>(null);
   const [isCreatingContractForPreview, setIsCreatingContractForPreview] = useState(false);
+  const [isSubmittingSigningFromPreview, setIsSubmittingSigningFromPreview] =
+    useState(false);
   const [batchPreviewItems, setBatchPreviewItems] = useState<
     Array<{ key: string; label: string; previewUrl: string }>
   >([]);
@@ -4425,7 +4427,11 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                       {isCreatingContractForPreview ? '正在创建…' : '发起签署'}
                     </Button>
                   ) : (
-                    <Button type="button" onClick={async () => {
+                    <Button
+                      type="button"
+                      disabled={isSubmittingSigningFromPreview}
+                      onClick={async () => {
+                      setIsSubmittingSigningFromPreview(true);
                       try {
                         // 电子签署：先调用后端函数创建第三方签署合同（拿到 signUrl / contractId 等）
                         // 线下签署：不走第三方
@@ -4783,9 +4789,12 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                             duration: 5000
                           }
                         );
+                      } finally {
+                        setIsSubmittingSigningFromPreview(false);
                       }
-                    }}>
-                      立即发起
+                    }}
+                    >
+                      {isSubmittingSigningFromPreview ? '正在发起…' : '立即发起'}
                     </Button>
                   )}
                 </DialogFooter>

@@ -3,7 +3,7 @@
  * 爱签相关环境变量（Deno.env，本地写在 supabase/functions/.env）：
  * - ASIGN_PRIVATE_KEY / ASIGN_APP_ID / ASIGN_BASE_URL
  * - ASIGN_NOTIFY_URL / ASIGN_CALLBACK_URL（公网 HTTPS；createContract 的 bizData）
- * - createContract 默认不传 redirectUrl（不配置签署完成后的页面跳转）；仅当请求体含非空 redirectUrl 时写入 bizData
+ * - createContract **绝不**向爱签 bizData 传递 redirectUrl / redirect_url（含 templates[].fillData）；请求里若误带会在调用爱签前剥离，避免签署完成后浏览器跳转
  * - ASIGN_SIGN_HASH：SHA256（默认）或 SHA1 → 见 _shared/asign-client.ts
  * - ASIGN_SIGN_PLAINTEXT_MODE：kv_sorted（默认）或 bizdata_only 等
  * - contractFileStorage 模式需 SUPABASE_SERVICE_ROLE_KEY（仅用下载暂存 PDF，不参与爱签）
@@ -60,7 +60,6 @@ type CreateSigningBody = {
   validityTime?: number;
   autoContinue?: number;
   readSeconds?: number;
-  redirectUrl?: string;
   refuseOn?: number;
   notifyUrl?: string;
   callbackUrl?: string;
@@ -164,10 +163,56 @@ function strangerToBizData(s: CreateSigningStranger): Record<string, unknown> {
   return row;
 }
 
-/** 仅当调用方显式传入非空 redirectUrl 时使用；不再回退 ASIGN_REDIRECT_URL，避免签署完成后跳转 */
-function explicitRedirectUrl(body: CreateSigningBody): string | undefined {
-  const s = typeof body.redirectUrl === "string" ? body.redirectUrl.trim() : "";
-  return s || undefined;
+/** 仅用于日志：是否在 JSON 中出现 redirect 相关键名（不记录具体 URL） */
+function jsonContainsRedirectKeyNames(payload: unknown): boolean {
+  try {
+    return /\bredirectUrl\b|\bredirect_url\b/i.test(JSON.stringify(payload));
+  } catch {
+    return false;
+  }
+}
+
+/** 递归删除对象/数组中的 redirectUrl、redirect_url（仅处理 templates 子树，避免误伤 contractFiles） */
+function stripRedirectKeysDeep(value: unknown, depth: number): void {
+  if (depth > 24 || value === null || value === undefined) return;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      stripRedirectKeysDeep(item, depth + 1);
+    }
+    return;
+  }
+  if (typeof value !== "object") return;
+  const o = value as Record<string, unknown>;
+  delete o.redirectUrl;
+  delete o.redirect_url;
+  for (const k of Object.keys(o)) {
+    stripRedirectKeysDeep(o[k], depth + 1);
+  }
+}
+
+/**
+ * 签署完成跳转：不向爱签 createContract 传递。
+ * 根对象 + templates[] 整棵子树去掉 redirectUrl / redirect_url（含 fillData 深层嵌套）。
+ */
+function stripRedirectFieldsFromCreateSigningBody(body: CreateSigningBody): { hadIncomingRedirectKeys: boolean } {
+  const hadIncomingRedirectKeys = jsonContainsRedirectKeyNames(body);
+  const root = body as Record<string, unknown>;
+  delete root.redirectUrl;
+  delete root.redirect_url;
+  if (Array.isArray(body.templates)) {
+    for (const tpl of body.templates) {
+      stripRedirectKeysDeep(tpl, 0);
+    }
+  }
+  if (jsonContainsRedirectKeyNames(body)) {
+    console.warn(
+      "[create-signing][ASIGN_REDIRECT] 剥离后请求体仍出现 redirect 键名字样，请检查是否非常规嵌套或字符串内嵌",
+    );
+  }
+  if (hadIncomingRedirectKeys) {
+    console.log("[create-signing][ASIGN_REDIRECT] 请求体曾含 redirectUrl/redirect_url，已全部剥离后再调爱签");
+  }
+  return { hadIncomingRedirectKeys };
 }
 
 function bizDataRecordLikeNodeDemo(body: CreateSigningBody): Record<string, unknown> {
@@ -183,10 +228,6 @@ function bizDataRecordLikeNodeDemo(body: CreateSigningBody): Record<string, unkn
     needAgree: body.needAgree ?? 0,
     signOrder: body.signOrder ?? 1,
   };
-  const redirect = explicitRedirectUrl(body);
-  if (redirect) {
-    raw.redirectUrl = redirect;
-  }
   if (Array.isArray(body.templates) && body.templates.length > 0) {
     raw.templates = body.templates;
   }
@@ -239,19 +280,27 @@ async function callAsignCreateContract(body: CreateSigningBody) {
     needAgree: body.needAgree ?? 0,
     signOrder: body.signOrder ?? 1,
   };
-  const redirect = explicitRedirectUrl(body);
-  if (redirect) {
-    bizDataInput.redirectUrl = redirect;
-  }
   if (Array.isArray(body.templates) && body.templates.length > 0) {
     bizDataInput.templates = body.templates;
+  }
+
+  const strictForSign = bizDataRecordLikeNodeDemo(body);
+  const leakInInput = /\bredirectUrl\b|\bredirect_url\b/i.test(JSON.stringify(bizDataInput));
+  const leakInStrict = /\bredirectUrl\b|\bredirect_url\b/i.test(JSON.stringify(strictForSign));
+  if (leakInInput || leakInStrict) {
+    console.error("[create-signing][ASIGN_REDIRECT] 异常：待发 createContract bizData 仍含 redirect 键名", {
+      leakInInput,
+      leakInStrict,
+    });
+  } else {
+    console.log("[create-signing][ASIGN_REDIRECT] 待发 createContract bizData 校验：无 redirectUrl/redirect_url 键名");
   }
 
   return callAsignFormPost({
     path: "contract/createContract",
     bizDataInput,
     keepEmptyStringKeys: ["notifyUrl", "callbackUrl"],
-    strictBizDataOverride: bizDataRecordLikeNodeDemo(body),
+    strictBizDataOverride: strictForSign,
     contractFiles: body.contractFiles?.length ? body.contractFiles : undefined,
   });
 }
@@ -282,6 +331,7 @@ serve(async (req) => {
       const detail = parseErr instanceof Error ? parseErr.message : String(parseErr);
       return json({ ok: false, error: "请求体不是合法 JSON", detail }, 400);
     }
+    const redirectStripMeta = stripRedirectFieldsFromCreateSigningBody(body);
     if (!body?.contractNo || !body?.contractName) {
       return json({ error: "缺少 contractNo / contractName" }, 400);
     }
@@ -347,6 +397,20 @@ serve(async (req) => {
       contractFiles,
       ...(hasTemplates ? { templates: body.templates } : {}),
     };
+
+    const bodyForAsignLogSafe = {
+      ...bodyForAsign,
+      contractFiles: bodyForAsign.contractFiles?.map((f) => ({
+        filename: f.filename,
+        contentType: f.contentType,
+        bytesLength: f.bytes?.byteLength ?? 0,
+      })),
+    };
+    console.log("[create-signing] bodyForAsign (contractFiles 仅摘要)", JSON.stringify(bodyForAsignLogSafe, null, 2));
+    console.log(
+      "[create-signing][ASIGN_REDIRECT] 原始请求是否含 redirect 键名（已剥离）:",
+      redirectStripMeta.hadIncomingRedirectKeys,
+    );
 
     const strangersRaw = Array.isArray(body.strangers) ? body.strangers : [];
     const seenStrangerAccounts = new Set<string>();
