@@ -102,6 +102,36 @@ import {
   type AsignTemplateControlHints,
 } from '@/utils/extractAsignTemplateControlHints';
 
+/** 从库表公司行同步签署页与爱签 fillData 共用的公司维度字段（含社保补贴、基本薪资等） */
+function companyToSigningCompanySnapshot(company: Company) {
+  return {
+    name: company.name || '',
+    code: company.credit_no || '',
+    address: company.address || '',
+    contact_person: company.contact_person || '',
+    contact_phone: company.contact_phone || '',
+    legal_representative: company.legal_person || '',
+    region: company.region || '',
+    payday_date: company.payday_date ?? null,
+    base_salary: company.base_salary != null ? Number(company.base_salary) : null,
+    social_insurance_subsidy:
+      company.social_insurance_subsidy != null ? Number(company.social_insurance_subsidy) : null,
+  };
+}
+
+const EMPTY_SIGNING_COMPANY_SNAPSHOT = {
+  name: '',
+  code: '',
+  address: '',
+  contact_person: '',
+  contact_phone: '',
+  legal_representative: '',
+  region: '',
+  payday_date: null as number | null,
+  base_salary: null as number | null,
+  social_insurance_subsidy: null as number | null,
+};
+
 export default function SigningsPage() {
   const { profile } = useAuth();
   const [searchParams] = useSearchParams();
@@ -156,25 +186,11 @@ export default function SigningsPage() {
   };
   const [employeesFormData, setEmployeesFormData] = useState<EmployeeFormData[]>([]);
 
-  // 公司表单数据
-  const [companyFormData, setCompanyFormData] = useState({
-    name: '',
-    code: '',
-    address: '',
-    contact_person: '',
-    contact_phone: '',
-    legal_representative: ''
-  });
-  
+  // 公司表单数据（与爱签 buildAsignFillDataForContract 公司维度对齐）
+  const [companyFormData, setCompanyFormData] = useState({ ...EMPTY_SIGNING_COMPANY_SNAPSHOT });
+
   // 最终使用的公司表单数据（用于单方签署时自动获取）
-  const [finalCompanyFormData, setFinalCompanyFormData] = useState({
-    name: '',
-    code: '',
-    address: '',
-    contact_person: '',
-    contact_phone: '',
-    legal_representative: ''
-  });
+  const [finalCompanyFormData, setFinalCompanyFormData] = useState({ ...EMPTY_SIGNING_COMPANY_SNAPSHOT });
 
   /** 电子签：第一步 createContract 的返回，第二步「立即发起」只做 addSigner + 落库 */
   type InvokeCreateSigningReturn = {
@@ -283,14 +299,7 @@ export default function SigningsPage() {
     if (formData.company_id) {
       const company = companies.find(c => c.id === formData.company_id);
       if (company) {
-        setCompanyFormData({
-          name: company.name || '',
-          code: company.credit_no || '',
-          address: company.address || '',
-          contact_person: company.contact_person || '',
-          contact_phone: company.contact_phone || '',
-          legal_representative: company.legal_person || ''
-        });
+        setCompanyFormData(companyToSigningCompanySnapshot(company));
       }
     }
   }, [formData.company_id, companies]);
@@ -374,14 +383,7 @@ export default function SigningsPage() {
     });
     // 重置表单数据
     setEmployeesFormData([]);
-    setCompanyFormData({
-      name: '',
-      code: '',
-      address: '',
-      contact_person: '',
-      contact_phone: '',
-      legal_representative: ''
-    });
+    setCompanyFormData({ ...EMPTY_SIGNING_COMPANY_SNAPSHOT });
     // 清理预览URL
     if (previewFileUrl && previewFileUrl.startsWith('blob:')) {
       URL.revokeObjectURL(previewFileUrl);
@@ -2344,14 +2346,7 @@ export default function SigningsPage() {
       // 如果不需要公司签署，但文书中可能需要显示公司名称，从companies列表中获取
       const selectedCompany = companies.find(c => c.id === formData.company_id);
       if (selectedCompany) {
-        tempFinalCompanyFormData = {
-          name: selectedCompany.name || '',
-          code: selectedCompany.credit_no || '',
-          address: selectedCompany.address || '',
-          contact_person: selectedCompany.contact_person || '',
-          contact_phone: selectedCompany.contact_phone || '',
-          legal_representative: selectedCompany.legal_person || ''
-        };
+        tempFinalCompanyFormData = companyToSigningCompanySnapshot(selectedCompany);
       }
     }
     
@@ -2390,7 +2385,7 @@ export default function SigningsPage() {
     if (formData.signing_mode === 'electronic') {
       setIsCreatingContractForPreview(true);
       try {
-        const needsCompanySigner = selectedTemplatesWithAsign.some(
+        const anyTemplateNeedsCompanySigner = selectedTemplatesWithAsign.some(
           (t) => t.requires_company_signature,
         );
         const hasAsignIdentForBatch = (t: DocumentTemplate) =>
@@ -2418,9 +2413,10 @@ export default function SigningsPage() {
             for (const emp of employeesFormData) {
               batchIndex += 1;
               toast.info(`正在创建爱签合同（${batchIndex}/${totalRounds}）…`);
+              const roundNeedsCompanySigner = docTemplate.requires_company_signature;
               const strangersOne = buildAsignStrangersForCreateSigning(
                 [emp],
-                needsCompanySigner ? companySnapshot : undefined,
+                roundNeedsCompanySigner ? companySnapshot : undefined,
               );
               const result = await invokeCreateSigning({
                 strangers: strangersOne,
@@ -2462,7 +2458,7 @@ export default function SigningsPage() {
         } else {
           const strangers = buildAsignStrangersForCreateSigning(
             employeesFormData,
-            needsCompanySigner ? companySnapshot : undefined,
+            anyTemplateNeedsCompanySigner ? companySnapshot : undefined,
           );
           const result = await invokeCreateSigning({
             strangers,
@@ -4443,9 +4439,10 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                           const selectedTemplatesForAsign = templates.filter((t) =>
                             formData.template_ids.includes(t.id)
                           );
-                          const needsCompanySigner = selectedTemplatesForAsign.some(
-                            (t) => t.requires_company_signature
-                          );
+                          const anyTemplateNeedsCompanySigner =
+                            selectedTemplatesForAsign.some(
+                              (t) => t.requires_company_signature,
+                            );
 
                           const employeesWithoutPhone = employeesFormData.filter(
                             (e) => !(e.phone || '').trim().replace(/\s/g, '')
@@ -4461,7 +4458,7 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                               }`
                             );
                           }
-                          if (needsCompanySigner) {
+                          if (anyTemplateNeedsCompanySigner) {
                             const companyPhone = (finalCompanyFormData.contact_phone || '')
                               .trim()
                               .replace(/\s/g, '');
@@ -4506,7 +4503,7 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                               const signersRound = buildAsignAddSignerItemsForEmployees(
                                 [emp],
                                 {
-                                  appendCompany: needsCompanySigner
+                                  appendCompany: docTemplate.requires_company_signature
                                     ? finalCompanyFormData
                                     : undefined,
                                   contractAttachNo: contractAttachNoRound,
@@ -4580,7 +4577,7 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                             const signersFromDraft = buildAsignAddSignerItemsForEmployees(
                               employeesFormData,
                               {
-                                appendCompany: needsCompanySigner
+                                appendCompany: anyTemplateNeedsCompanySigner
                                   ? finalCompanyFormData
                                   : undefined,
                                 contractAttachNo,
@@ -4613,9 +4610,11 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                                 toast.info(
                                   `正在创建爱签合同（${batchIndex}/${totalRounds}）…`,
                                 );
+                                const roundNeedsCompanySigner =
+                                  docTemplate.requires_company_signature;
                                 const strangersOne = buildAsignStrangersForCreateSigning(
                                   [emp],
-                                  needsCompanySigner ? finalCompanyFormData : undefined,
+                                  roundNeedsCompanySigner ? finalCompanyFormData : undefined,
                                 );
                                 const result = await invokeCreateSigning({
                                   strangers: strangersOne,
@@ -4635,7 +4634,7 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                                 const signersRound = buildAsignAddSignerItemsForEmployees(
                                   [emp],
                                   {
-                                    appendCompany: needsCompanySigner
+                                    appendCompany: roundNeedsCompanySigner
                                       ? finalCompanyFormData
                                       : undefined,
                                     contractAttachNo: contractAttachNoRound,
@@ -4697,7 +4696,7 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                           } else {
                             const strangers = buildAsignStrangersForCreateSigning(
                               employeesFormData,
-                              needsCompanySigner ? finalCompanyFormData : undefined,
+                              anyTemplateNeedsCompanySigner ? finalCompanyFormData : undefined,
                             );
                             const result = await invokeCreateSigning({ strangers });
                             const contractNoForAsign = result.effectiveContractNo;
@@ -4709,7 +4708,9 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                             const contractAttachNo = getAsignCreateContractAttachNo(result.asign);
 
                             const signers = buildAsignAddSignerItemsForEmployees(employeesFormData, {
-                              appendCompany: needsCompanySigner ? finalCompanyFormData : undefined,
+                              appendCompany: anyTemplateNeedsCompanySigner
+                                ? finalCompanyFormData
+                                : undefined,
                               contractAttachNo,
                               asignTemplateHints: result.asignTemplateHints,
                             });

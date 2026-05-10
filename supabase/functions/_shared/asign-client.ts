@@ -7,9 +7,7 @@ import md5 from "https://esm.sh/md5@2.3.0";
 import { decodeBase64 } from "https://deno.land/std@0.224.0/encoding/base64.ts";
 
 /** 仅本地临时兜底，勿提交私钥；优先 ASIGN_PRIVATE_KEY */
-export const ASIGN_PRIVATE_KEY_FALLBACK =
-  "MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCeoodWSIfw7nNiieByJbmDVWWicJSd+6qaDhiXzECuxpmYTSdKXRBuF8h892TG86MrifOq2ftK+BWK0CcwA9u0TEFufsjEMS8LS/JhPUBQ7GRrq1JEuosryG/s+adFW4Iyt9b0PNnt68VsR8159hTKf8z1VH3iGLDrZ+6pZXXrdyS7E+TPxlUSqc/PbTWh5zoH2UEELzKrBtfAMz9OZVyLiDyLtlv6tNikluWiIbRI9xbP7WQTCMIC/7s0RiP0Y0XstJJ7S4PlB0GbhKeGHr7RW7iL0BqKN0017IvIPz4TiH/vjrQ17jZs8DWqtPevm67QKfdninacb7HUhH5PH1nBAgMBAAECggEAaOzvv25yHDZcM40m29l//xJ5CxyT8HsJuKQiOCVtkyzhYw+FMXak62znu2CXU9DK2H2CojtUL54wAYT0ppmmtHbLwJ4zhTFTAJHXW+H7rIrvURgcbkFE1EzbW082CHYihBF9KEcnjmsoRhqoGkdeMSKfGpYsPWQ/gTVZcsodWQSGsAHgyDK7haNHIjG0gL8jRGqFuqLQpJBUQ9qCuRJUkqeWwMtnZKJHXF15jYJrfLnpqhDvCBp/IU9+At3aTAql4RWwl0e6k8FFtno6/gTQnuyDXVDouf7FCt2kbfzDrtjeev4TwX63a1M+fZvsK5LqJKIiIq8tR1Zf9ESQxTbPUQKBgQDNd0jPV8J1nCFrvsDj8fI4MhbSEdHJYlqTT4h9nZrEw7782+fSyvVc6PQLjK+Z5TFnWX5rO3h4ahkybp/uB8dIGyAs1pnggt2LGYWY3ySlreE9xMV+D9IMwhiwupAOkbMxvmwOCALVgnoaK7z6dD03e26EtiVX9EekQsGENGzdLwKBgQDFpqCtI2zCeca0BP+e5Uylx5lRLNoGkWbVyjpqQ+JZAkZw8B5tT7ktE76AuY2kL7kUkXdaBR94OtGz9tUqdL3nBja5DLP9UYKAlBd5eRQ7pyswJHG8eEW+orn+LsXUd5/7IpSW07yZn0EcXW8Jlu+wVd1OhYsa+wDqDHqXNXbcDwKBgCcOp86SVirZNRkwN6adFXhNPT1Nmd14TtN16PJIBWWl+CZE/zp4zk+NEOcpJTBR+yQ0RO3JbkslkAigMtKis+UnEuSzHqko90g738OBl4vPE+QUBZ7DDyDRvLPLoxrB45hvJEc+iptfpCpZaiEJ+6ESW53qqgqgKwY0kmi5NoCNAoGAfsD+eCqovAt2p8ow2Ij637Iim9FkvSOQTHjVf4KrbSOtYw5KpRWkjskDue/Fa08DpbIoVX3Fkcg+5efdCs41Xyw3+fKwlzsnsyfF6iwBEsSBSO2GVzTWnYwkNWNvkXNqEJc7rYJ6iBZ+nh85b2/xpSdbttijvhjMnEyGbeRmpncCgYBddcdByOYjQ+bquEdsnEBU67kvdfCw1kF+j+Mfhuq5tfL9KR9+bL7/7y1Cp924DWIt0VFdNBueEsI0SmG0eKx+VHd6aEOhTZqpWY+N3urDTl3/vV5Ywsl0pyYnPVZyvAgcI4D6JWh/V2t+zXS1yd4d/jxQu/JArmBUhgThv78L8g==";
-
+export const ASIGN_PRIVATE_KEY_FALLBACK = ''
 /** 爱签业务成功：常见为 0；不少接口返回 100000 + msg「成功」；部分环境为 10000 */
 export function isAsignBizSuccessCode(code: unknown): boolean {
   if (code === 0 || code === "0") return true;
@@ -277,7 +275,7 @@ export function bizDataRecordLikeNodeDemoGeneric(raw: Record<string, unknown>): 
 export function getAsignBaseUrl() {
   let baseUrl = Deno.env.get("ASIGN_BASE_URL")?.trim();
   if (!baseUrl) {
-    baseUrl = "https://prev.asign.cn";
+    baseUrl = "https://oapi.asign.cn";
   }
   return baseUrl.replace(/\/+$/, "");
 }

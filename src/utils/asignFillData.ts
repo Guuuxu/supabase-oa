@@ -18,7 +18,9 @@ export type AsignContractFillCompany = {
   contact_person: string;
   contact_phone: string;
   legal_representative: string;
-  payday_date: string | number;
+  /** 工作城市等模板控件；与 Company.region 对应 */
+  region?: string;
+  payday_date?: string | number | null;
   base_salary: number | null;
   social_insurance_subsidy: number | null;
 };

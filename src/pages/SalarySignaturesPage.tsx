@@ -133,7 +133,11 @@ function companyToAsignFill(company: Company): AsignContractFillCompany {
     contact_person: company.contact_person || '',
     contact_phone: company.contact_phone || '',
     legal_representative: company.legal_person || '',
-    payday_date: company.payday_date ?? '',
+    region: company.region || '',
+    payday_date: company.payday_date ?? null,
+    base_salary: company.base_salary != null ? Number(company.base_salary) : null,
+    social_insurance_subsidy:
+      company.social_insurance_subsidy != null ? Number(company.social_insurance_subsidy) : null,
   };
 }
 
