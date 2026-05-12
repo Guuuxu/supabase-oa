@@ -296,17 +296,7 @@ export default function EmployeesPage() {
       return;
     }
 
-    // 如果身份证号码已填写但未验证，提示用户
-    if (formData.id_card_number && idCardVerified === null) {
-      toast.error('请先验证身份证信息');
-      return;
-    }
-
-    // 如果验证失败，不允许提交
-    if (formData.id_card_number && idCardVerified === false) {
-      toast.error('身份证验证未通过，请检查姓名和身份证号码是否匹配');
-      return;
-    }
+    
 
     const submitData = {
       ...formData,
@@ -954,16 +944,7 @@ export default function EmployeesPage() {
                           idCardVerified === false && "border-red-500"
                         )}
                       />
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        onClick={verifyIdCard}
-                        disabled={verifying || !formData.name || !formData.id_card_number}
-                        className="shrink-0"
-                      >
-                        {verifying ? '验证中...' : idCardVerified === true ? '✓ 已验证' : '验证'}
-                      </Button>
+                      
                     </div>
                     {idCardError && (
                       <p className="text-xs text-red-500">{idCardError}</p>
@@ -971,9 +952,7 @@ export default function EmployeesPage() {
                     {idCardVerified === true && (
                       <p className="text-xs text-green-600">✓ 身份证验证通过</p>
                     )}
-                    <p className="text-xs text-muted-foreground">
-                      输入姓名和身份证号后点击验证按钮
-                    </p>
+                    
                   </div>
                   <div className="space-y-2">
                     <Label htmlFor="gender">性别 *</Label>
