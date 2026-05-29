@@ -18,6 +18,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
   callAsignFormPost,
   isAsignAddStrangerBenignResponse,
+  isAsignBizSuccessResponse,
   type AsignContractFile,
 } from "../_shared/asign-client.ts";
 import { corsHeaders } from "../_shared/cors.ts";
@@ -52,7 +53,7 @@ type CreateSigningBody = {
   user_id?: string;
   document_id?: string;
 
-  /** 创建合同前依次调用 v2/user/addStranger；成功后再 createContract */
+  /** 创建合同前：先 v2/user/getUser，未实名再 v2/user/addStranger；成功后再 createContract */
   strangers?: CreateSigningStranger[];
 
   contractNo: string;
@@ -136,6 +137,142 @@ function isAddStrangerBizOk(data: unknown): boolean {
   const asign = normalizeAsignPayload(data);
   if (!asign) return false;
   return isAsignAddStrangerBenignResponse(asign);
+}
+
+/** getUser 查询参数：account +（企业 creditCode / 个人 idCard），与开放平台 user/getUser 一致 */
+function strangerToGetUserBizData(
+  s: CreateSigningStranger,
+  bizData: Record<string, unknown>,
+): Record<string, unknown> {
+  const query: Record<string, unknown> = {};
+  const acc = String(bizData.account ?? "").trim();
+  if (acc) {
+    query.account = acc;
+  }
+  const userType = Number(s.userType);
+  if (userType === 1) {
+    const cc = (s.creditCode ?? "").trim();
+    if (cc) {
+      query.creditCode = cc;
+    }
+  } else {
+    const idc = (s.idCard ?? "").trim();
+    if (idc) {
+      query.idCard = idc;
+    }
+  }
+  return query;
+}
+
+/**
+ * user/getUser 响应体（爱签开放平台）：
+ * { code: 100000, msg: "成功", data: { account, status, identifyTime, authType, ... } }
+ * data.status：1=已认证，可跳过 addStranger。
+ */
+function readAsignGetUserRow(data: unknown): Record<string, unknown> | null {
+  const asign = normalizeAsignPayload(data);
+  if (!asign || !isAsignBizSuccessResponse(asign)) {
+    return null;
+  }
+  const payload = asign.data ?? asign.result;
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+  return payload as Record<string, unknown>;
+}
+
+function extractAsignUserVerifiedStatus(data: unknown): number | null {
+  const row = readAsignGetUserRow(data);
+  if (!row) {
+    return null;
+  }
+  const statusRaw = row.status ?? row.authStatus ?? row.auth_status;
+  if (statusRaw === null || statusRaw === undefined) {
+    return null;
+  }
+  const n = Number(statusRaw);
+  if (!Number.isFinite(n)) {
+    return null;
+  }
+  return n;
+}
+
+/** getUser 成功且已实名 → 跳过 addStranger */
+function describeGetUserSkipDecision(getUserRes: { ok: boolean; data: unknown }): {
+  skip: boolean;
+  reason: string;
+} {
+  const asign = normalizeAsignPayload(getUserRes.data);
+  if (!asign) {
+    return { skip: false, reason: "getUser 响应无法解析（data 为空或非对象）" };
+  }
+  if (!isAsignBizSuccessResponse(asign)) {
+    return {
+      skip: false,
+      reason: `getUser 业务失败 code=${String(asign.code ?? "")} msg=${String(asign.msg ?? "")}`,
+    };
+  }
+  const row = readAsignGetUserRow(getUserRes.data);
+  if (!row) {
+    return { skip: false, reason: "getUser 业务成功但 data/result 用户对象缺失" };
+  }
+  const status = extractAsignUserVerifiedStatus(getUserRes.data);
+  if (status === 1) {
+    return { skip: true, reason: "data.status=1（已认证）" };
+  }
+  const identifyTime = row.identifyTime ?? row.identify_time;
+  if (typeof identifyTime === "string" && identifyTime.trim()) {
+    if (status === 0 || status === 2) {
+      return {
+        skip: false,
+        reason: `有 identifyTime 但 status=${String(status)}（0=未认证，2=认证中）`,
+      };
+    }
+    return { skip: true, reason: `有 identifyTime 且 status 非 0/2（视为已认证）` };
+  }
+  return {
+    skip: false,
+    reason: `未满足跳过条件 status=${status === null ? "缺失" : String(status)} identifyTime=无`,
+  };
+}
+
+const LOG_GET_USER = "[create-signing][getUser]";
+
+function logGetUserOutcome(
+  account: string,
+  path: string,
+  query: Record<string, unknown>,
+  getUserRes: { ok: boolean; data: unknown },
+): { skip: boolean; reason: string } {
+  const decision = describeGetUserSkipDecision(getUserRes);
+  const row = readAsignGetUserRow(getUserRes.data);
+  const asign = normalizeAsignPayload(getUserRes.data);
+
+  console.log(LOG_GET_USER, "查询参数", JSON.stringify({ account, path, query }));
+  console.log(LOG_GET_USER, "原始响应", JSON.stringify(getUserRes.data, null, 2));
+
+  return decision;
+}
+
+function summarizeGetUserProbe(getUserRes: { ok: boolean; data: unknown }): Record<string, unknown> {
+  const asign = normalizeAsignPayload(getUserRes.data);
+  const row = readAsignGetUserRow(getUserRes.data);
+  const decision = describeGetUserSkipDecision(getUserRes);
+  return {
+    wrapperOk: getUserRes.ok,
+    asignCode: asign?.code ?? null,
+    asignMsg: asign?.msg ?? null,
+    verifiedStatus: extractAsignUserVerifiedStatus(getUserRes.data),
+    hasIdentifyTime: Boolean(
+      row &&
+        typeof (row.identifyTime ?? row.identify_time) === "string" &&
+        String(row.identifyTime ?? row.identify_time).trim(),
+    ),
+    skipAddStranger: decision.skip,
+    skipReason: decision.reason,
+    userData: row,
+    rawResponse: getUserRes.data,
+  };
 }
 
 function strangerToBizData(s: CreateSigningStranger): Record<string, unknown> {
@@ -406,19 +543,34 @@ serve(async (req) => {
         bytesLength: f.bytes?.byteLength ?? 0,
       })),
     };
-    console.log("[create-signing] bodyForAsign (contractFiles 仅摘要)", JSON.stringify(bodyForAsignLogSafe, null, 2));
-    console.log(
-      "[create-signing][ASIGN_REDIRECT] 原始请求是否含 redirect 键名（已剥离）:",
-      redirectStripMeta.hadIncomingRedirectKeys,
-    );
 
     const strangersRaw = Array.isArray(body.strangers) ? body.strangers : [];
     const seenStrangerAccounts = new Set<string>();
+    /** 官方文档接口地址：{host}/user/getUser（与 v2/user/addStranger 前缀不同，属正常） */
+    const getUserPath = (Deno.env.get("ASIGN_USER_GET_PATH") ?? "user/getUser").trim().replace(/^\/+/, "");
     for (const s of strangersRaw) {
       const bizData = strangerToBizData(s);
       const acc = String(bizData.account ?? "").trim();
       if (!acc || seenStrangerAccounts.has(acc)) continue;
       seenStrangerAccounts.add(acc);
+
+      const getUserBiz = strangerToGetUserBizData(s, bizData);
+      const getUserRes = await callAsignFormPost({
+        path: getUserPath,
+        bizDataInput: getUserBiz,
+      });
+      const skipDecision = logGetUserOutcome(acc, getUserPath, getUserBiz, getUserRes);
+      const getUserProbe = summarizeGetUserProbe(getUserRes);
+
+      if (skipDecision.skip) {
+        continue;
+      }
+
+      console.log("[create-signing][getUser] 未跳过，即将调用 addStranger", {
+        account: acc,
+        skipReason: skipDecision.reason,
+      });
+
       const addRes = await callAsignFormPost({
         path: "v2/user/addStranger",
         bizDataInput: bizData,
@@ -432,6 +584,7 @@ serve(async (req) => {
             detail: addRes.data,
             debug: addRes.debug,
             failedStrangerAccount: acc,
+            getUserProbe,
           },
           200,
         );
