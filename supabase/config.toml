@@ -401,6 +401,13 @@ enabled = true
 verify_jwt = true
 import_map = "./functions/add-asign-signatory/deno.json"
 entrypoint = "./functions/add-asign-signatory/index.ts"
+
+# 爱签：v2/contract/batchSignByAccount 企业批量签署短信（多合同一次通知）
+[functions.batch-asign-sign-by-account]
+enabled = true
+verify_jwt = true
+import_map = "./functions/batch-asign-sign-by-account/deno.json"
+entrypoint = "./functions/batch-asign-sign-by-account/index.ts"
 # Specifies static files to be bundled with the function. Supports glob patterns.
 # For example, if you want to serve static HTML pages in your function:
 # static_files = [ "./functions/create-signing/*.html" ]

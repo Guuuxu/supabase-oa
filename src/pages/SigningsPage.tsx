@@ -66,6 +66,7 @@ import {
   downloadAsignContractAndSyncArchive,
   withdrawAsignContract,
   addAsignSignatory,
+  batchAsignSignByAccount,
   getAsignTemplateList,
   getAsignTemplateData,
   getAttendanceRecordsByEmployee,
@@ -131,6 +132,75 @@ const EMPTY_SIGNING_COMPANY_SNAPSHOT = {
   base_salary: null as number | null,
   social_insurance_subsidy: null as number | null,
 };
+
+type SigningCompanySnapshot = typeof EMPTY_SIGNING_COMPANY_SNAPSHOT;
+
+/** 与爱签 addSigner / batchSignByAccount 共用的企业 account + 通知手机号 */
+function buildAsignCompanyAccountAndMobile(company: SigningCompanySnapshot): {
+  account: string;
+  mobile: string;
+} | null {
+  if (!(company.name || '').trim()) {
+    return null;
+  }
+  const credit = (company.code || '').trim().replace(/\s/g, '');
+  const contactMobile = (company.contact_phone || '').trim().replace(/\s/g, '');
+  const companyAccountRaw = (credit || contactMobile).toUpperCase();
+  const account = companyAccountRaw ? `ASIGN${companyAccountRaw}` : '';
+  if (!account || !contactMobile) {
+    return null;
+  }
+  return { account, mobile: contactMobile };
+}
+
+/** 爱签 batchSignByAccount 单次 contractNos 上限 */
+const ASIGN_BATCH_SIGN_CONTRACT_NOS_MAX = 15;
+
+function chunkStringList(items: string[], chunkSize: number): string[][] {
+  const chunks: string[][] = [];
+  for (let i = 0; i < items.length; i += chunkSize) {
+    chunks.push(items.slice(i, i + chunkSize));
+  }
+  return chunks;
+}
+
+/** 多员工双方签署：addSigner 不给企业发短信，改调爱签 batchSignByAccount */
+async function sendCompanyBatchSignSmsForContracts(
+  contractNos: string[],
+  company: SigningCompanySnapshot,
+): Promise<void> {
+  const creds = buildAsignCompanyAccountAndMobile(company);
+  if (!creds) {
+    throw new Error('企业批量签署短信：请填写企业联系电话与统一社会信用代码');
+  }
+  const uniqueNos = Array.from(new Set(contractNos.map((n) => n.trim()).filter(Boolean)));
+  if (uniqueNos.length === 0) {
+    return;
+  }
+  const parseEnvInt = (raw: string | undefined, fallback: number): number => {
+    if (raw === undefined || String(raw).trim() === '') return fallback;
+    const n = parseInt(String(raw), 10);
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+  };
+  const validateTypeEnterprise = parseEnvInt(
+    import.meta.env.VITE_ASIGN_VALIDATE_TYPE_ENTERPRISE,
+    1,
+  );
+  const chunks = chunkStringList(uniqueNos, ASIGN_BATCH_SIGN_CONTRACT_NOS_MAX);
+  for (let i = 0; i < chunks.length; i += 1) {
+    const chunk = chunks[i];
+    const res = await batchAsignSignByAccount({
+      account: creds.account,
+      mobile: creds.mobile,
+      isNotice: 1,
+      contractNos: chunk,
+      validateType: validateTypeEnterprise,
+    });
+    if (!res.success) {
+      throw new Error(res.error || `企业批量签署短信发送失败（第 ${i + 1}/${chunks.length} 批）`);
+    }
+  }
+}
 
 export default function SigningsPage() {
   const { profile } = useAuth();
@@ -2749,6 +2819,8 @@ export default function SigningsPage() {
       contractAttachNo?: number;
       /** 由 getTemplateData 实时解析；爱签模板发起时必传，签署策略与模板控件一致 */
       asignTemplateHints?: AsignTemplateControlHints;
+      /** 为 true 时企业签署方 addSigner 不发短信（改由 batchSignByAccount 批量通知） */
+      suppressCompanySms?: boolean;
     },
   ): AsignAddSignerItem[] => {
     const attachNo = options?.contractAttachNo ?? 1;
@@ -2935,24 +3007,19 @@ export default function SigningsPage() {
 
     const company = options?.appendCompany;
     let companyItem: AsignAddSignerItem | null = null;
-    if (company && (company.name || '').trim()) {
-      const credit = (company.code || '').trim().replace(/\s/g, '');
-      const contactMobile = (company.contact_phone || '').trim().replace(/\s/g, '');
-      const companyAccountRaw = (credit || contactMobile).toUpperCase();
-      const companyAccount = companyAccountRaw ? `ASIGN${companyAccountRaw}` : '';
-      if (companyAccount && contactMobile) {
-        const nextCompanyItem: AsignAddSignerItem = {
-          account: companyAccount,
-          signType: 3,
-          validateType: validateTypeEnterprise,
-          noticeMobile: contactMobile,
-          signOrder: '1',
-          isNotice: 1,
-          isEnterpriseSigner: true,
-          signStrategyList: strategyPartyA.map((s) => ({ ...s })),
-        };
-        companyItem = nextCompanyItem;
-      }
+    const companyCreds = company ? buildAsignCompanyAccountAndMobile(company) : null;
+    if (companyCreds) {
+      const nextCompanyItem: AsignAddSignerItem = {
+        account: companyCreds.account,
+        signType: 3,
+        validateType: validateTypeEnterprise,
+        noticeMobile: companyCreds.mobile,
+        signOrder: '1',
+        isNotice: options?.suppressCompanySms ? 0 : 1,
+        isEnterpriseSigner: true,
+        signStrategyList: strategyPartyA.map((s) => ({ ...s })),
+      };
+      companyItem = nextCompanyItem;
     }
 
     const ordered: AsignAddSignerItem[] = [];
@@ -4488,24 +4555,41 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                             );
                           };
 
-                          /** 已在「发起签署」步骤创建合同：此处仅 addSigner + 每人落库 */
+                          /**  员工数 > 1 或 文书数 > 1
+                           * 已在「发起签署」步骤创建合同：此处仅 addSigner + 每人落库 
+                           * 「发起签署」步骤：
+                           * 1. 创建合同
+                           * 2. 添加签署方
+                           * 3. 落库
+                           */
                           if (pendingElectronicSigningDraft?.kind === 'batch') {
                             const totalRounds = pendingElectronicSigningDraft.items.length;
+                            /** 多员工 + 存在需双方签署的文书 → 企业短信改走 batchSignByAccount，addSigner 侧 suppressCompanySms */
+                            const useCompanyBatchSignSms =
+                              employeesFormData.length > 1 && anyTemplateNeedsCompanySigner;
+                            /** 收集需企业盖章的合同号，循环结束后一次性 batchSignByAccount */
+                            const bilateralContractNosForBatchSms: string[] = [];
                             let done = 0;
                             for (const item of pendingElectronicSigningDraft.items) {
                               done += 1;
                               toast.info(`正在添加签署方（${done}/${totalRounds}）…`);
                               const { result, docTemplate, fillEmployee: emp } = item;
                               const contractNoForRound = result.effectiveContractNo;
+                              /** 当前这份文书是否需要企业（甲方）盖章 */
+                              const roundNeedsCompanySigner =
+                                docTemplate.requires_company_signature;
                               const thirdPartySigningIdRound = readThirdPartySigningId(result.asign);
                               const contractAttachNoRound =
                                 getAsignCreateContractAttachNo(result.asign);
                               const signersRound = buildAsignAddSignerItemsForEmployees(
                                 [emp],
                                 {
-                                  appendCompany: docTemplate.requires_company_signature
+                                  appendCompany: roundNeedsCompanySigner
                                     ? finalCompanyFormData
                                     : undefined,
+                                  // 与下方收集 contractNo 条件一致：企业不发 addSigner 短信，改 batchSignByAccount
+                                  suppressCompanySms:
+                                    useCompanyBatchSignSms && roundNeedsCompanySigner,
                                   contractAttachNo: contractAttachNoRound,
                                   asignTemplateHints: result.asignTemplateHints,
                                 },
@@ -4523,6 +4607,10 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                                 throw new Error(
                                   addSignResRound.error || '添加签署方失败',
                                 );
+                              }
+                              // 多员工双方签：本合同已 addSigner 且企业 isNotice=0，记入列表待 batchSignByAccount 批量发短信
+                              if (useCompanyBatchSignSms && roundNeedsCompanySigner) {
+                                bilateralContractNosForBatchSms.push(contractNoForRound);
                               }
                               const rec = await createSigningRecord({
                                 company_id: formData.company_id,
@@ -4544,11 +4632,19 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                                 );
                               }
                             }
+                            if (bilateralContractNosForBatchSms.length > 0) {
+                              toast.info('正在向企业发送批量签署短信…');
+                              await sendCompanyBatchSignSmsForContracts(
+                                bilateralContractNosForBatchSms,
+                                finalCompanyFormData,
+                              );
+                            }
                             toast.success(
                               `签署发起成功！已创建 ${totalRounds} 笔爱签合同（${selectedTemplatesForAsign.length} 份文书 × ${employeesFormData.length} 名员工）。`,
                               {
-                                description:
-                                  '每位员工每份文书对应独立合同号；请留意短信签署链接。',
+                                description: useCompanyBatchSignSms
+                                  ? '员工将各自收到签署短信；企业将收到一条批量签署短信。'
+                                  : '每位员工每份文书对应独立合同号；请留意短信签署链接。',
                                 duration: 6000,
                               },
                             );
@@ -4601,6 +4697,11 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                             (employeesFormData.length > 1 || selectedTemplatesForAsign.length > 1)
                           ) {
                             /** 多份爱签模板：每人每份文书一单合同（未走两步预览时的兼容路径） */
+                            /** 多员工 + 存在需双方签署的文书 → 企业短信改走 batchSignByAccount */
+                            const useCompanyBatchSignSms =
+                              employeesFormData.length > 1 && anyTemplateNeedsCompanySigner;
+                            /** 收集需企业盖章的合同号，循环结束后一次性 batchSignByAccount */
+                            const bilateralContractNosForBatchSms: string[] = [];
                             let batchIndex = 0;
                             const totalRounds =
                               selectedTemplatesForAsign.length * employeesFormData.length;
@@ -4610,6 +4711,7 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                                 toast.info(
                                   `正在创建爱签合同（${batchIndex}/${totalRounds}）…`,
                                 );
+                                /** 当前这份文书是否需要企业（甲方）盖章 */
                                 const roundNeedsCompanySigner =
                                   docTemplate.requires_company_signature;
                                 const strangersOne = buildAsignStrangersForCreateSigning(
@@ -4637,6 +4739,9 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                                     appendCompany: roundNeedsCompanySigner
                                       ? finalCompanyFormData
                                       : undefined,
+                                    // 与下方收集 contractNo 条件一致：企业不发 addSigner 短信，改 batchSignByAccount
+                                    suppressCompanySms:
+                                      useCompanyBatchSignSms && roundNeedsCompanySigner,
                                     contractAttachNo: contractAttachNoRound,
                                     asignTemplateHints: result.asignTemplateHints,
                                   },
@@ -4654,6 +4759,10 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                                   throw new Error(
                                     addSignResRound.error || '添加签署方失败',
                                   );
+                                }
+                                // 多员工双方签：本合同已 addSigner 且企业 isNotice=0，记入列表待 batchSignByAccount 批量发短信
+                                if (useCompanyBatchSignSms && roundNeedsCompanySigner) {
+                                  bilateralContractNosForBatchSms.push(contractNoForRound);
                                 }
                                 const rec = await createSigningRecord({
                                   company_id: formData.company_id,
@@ -4676,11 +4785,19 @@ body{margin:0;padding:16px;font-family:"SimSun","宋体",serif;line-height:1.8;f
                                 }
                               }
                             }
+                            if (bilateralContractNosForBatchSms.length > 0) {
+                              toast.info('正在向企业发送批量签署短信…');
+                              await sendCompanyBatchSignSmsForContracts(
+                                bilateralContractNosForBatchSms,
+                                finalCompanyFormData,
+                              );
+                            }
                             toast.success(
                               `签署发起成功！已创建 ${totalRounds} 笔爱签合同（${selectedTemplatesForAsign.length} 份文书 × ${employeesFormData.length} 名员工）。`,
                               {
-                                description:
-                                  '每位员工每份文书对应独立合同号；请留意短信签署链接。',
+                                description: useCompanyBatchSignSms
+                                  ? '员工将各自收到签署短信；企业将收到一条批量签署短信。'
+                                  : '每位员工每份文书对应独立合同号；请留意短信签署链接。',
                                 duration: 6000,
                               },
                             );

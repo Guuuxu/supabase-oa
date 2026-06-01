@@ -428,6 +428,58 @@ export async function addAsignSignatory(
   }
 }
 
+/** 爱签 v2/contract/batchSignByAccount：同一 account 多合同批量发起签署短信 */
+export type BatchAsignSignByAccountParams = {
+  account: string;
+  mobile?: string;
+  isNotice?: number;
+  /** 单次最多 15 个合同号 */
+  contractNos: string[];
+  validateType?: number;
+};
+
+export async function batchAsignSignByAccount(
+  params: BatchAsignSignByAccountParams,
+): Promise<{ success: boolean; data?: unknown; error?: string }> {
+  try {
+    const { data, error } = await supabase.functions.invoke('batch-asign-sign-by-account', {
+      body: {
+        account: params.account,
+        mobile: params.mobile,
+        is_notice: params.isNotice ?? 1,
+        contract_nos: params.contractNos,
+        validate_type: params.validateType,
+      },
+    });
+
+    if (error) {
+      let errorMsg: string | undefined;
+      try {
+        errorMsg = await error?.context?.text?.();
+      } catch {
+        errorMsg = undefined;
+      }
+      const fallback = error?.message || '企业批量签署短信发送失败';
+      console.error('[BATCH_ASIGN_SIGN_BY_ACCOUNT] invoke 失败:', errorMsg || fallback);
+      return { success: false, error: errorMsg || fallback };
+    }
+
+    const payload = data as Record<string, unknown> | null;
+    if (!payload || payload.ok !== true) {
+      const errMsg =
+        payload && typeof payload.error === 'string'
+          ? payload.error
+          : '爱签 batchSignByAccount 失败';
+      return { success: false, error: errMsg, data };
+    }
+
+    return { success: true, data };
+  } catch (err) {
+    console.error('[BATCH_ASIGN_SIGN_BY_ACCOUNT] 异常:', err);
+    return { success: false, error: '企业批量签署短信发送异常' };
+  }
+}
+
 // 检查合同到期并发送通知
 export async function checkContractExpiry(): Promise<{ success: boolean; count?: number; error?: string }> {
   try {
