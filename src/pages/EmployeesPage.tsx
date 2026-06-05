@@ -45,7 +45,7 @@ import {
 } from '@/components/ui/command';
 import { Badge } from '@/components/ui/badge';
 import { Checkbox } from '@/components/ui/checkbox';
-import { getEmployees, getCompanies, createEmployee, updateEmployee, deleteEmployee, createEmployeesBatch } from '@/db/api';
+import { getEmployees, getCompanies, createEmployee, updateEmployee, deleteEmployee, createEmployeesBatch, queryAsignUserInfo, modifyAsignUserInfo, modifyAsignStrangerInfo, removeAsignUser } from '@/db/api';
 import { EMPLOYEE_STATUS_LABELS } from '@/types/types';
 import type { Employee, Company, EmployeeStatus } from '@/types/types';
 import { toast } from 'sonner';
@@ -55,6 +55,11 @@ import { exportToCSV, formatDate } from '@/utils/exportUtils';
 import * as XLSX from 'xlsx';
 import { useAuth } from '@/contexts/AuthContext';
 import { cn } from '@/lib/utils';
+import {
+  ASIGN_USER_STATUS_LABELS,
+  buildAsignPersonalAccount,
+  type AsignUserQueryStatus,
+} from '@/utils/asignUserStatus';
 
 export default function EmployeesPage() {
   const { profile } = useAuth();
@@ -222,6 +227,73 @@ export default function EmployeesPage() {
     }
   };
 
+  /** 编辑员工成功后：查询爱签 user/getUser，按 code 判断用户状态（后续同步操作待补充） */
+  const syncAsignUserInfoAfterEmployeeEdit = async (employeeForm: typeof formData): Promise<AsignUserQueryStatus | null> => {
+    const idCard = String(employeeForm.id_card_number ?? '').trim().replace(/\s/g, '').toUpperCase();
+    if (!idCard) {
+      console.log('[ASIGN_USER_SYNC] 跳过：员工无身份证号');
+      return null;
+    }
+
+    const account = buildAsignPersonalAccount(idCard);
+    console.log('[ASIGN_USER_SYNC] 开始查询', { account, idCard });
+
+    try {
+      const result = await queryAsignUserInfo({ account, id_card: idCard });
+      if (!result.ok) {
+        console.warn('[ASIGN_USER_SYNC] 查询失败', result);
+        return null;
+      }
+
+      const { status, asign_code, asign_msg, user_data } = result;
+
+      if (asign_code === '100000') {
+        console.log('[ASIGN_USER_SYNC] 用户已认证，调用 modifyUserName 同步', { user_data });
+        const name = String(employeeForm.name ?? '').trim();
+        const mobile = String(employeeForm.phone ?? '').trim();
+        if (!name || !mobile) {
+          console.warn('[ASIGN_USER_SYNC] 跳过 modifyUserName：缺少姓名或手机号', { name, mobile });
+        } else {
+          const modifyResult = await modifyAsignUserInfo({
+            account,
+            name,
+            mobile,
+            identify_type: 2,
+          });
+          if (modifyResult.ok) {
+            console.log('[ASIGN_USER_SYNC] modifyUserName 成功', modifyResult);
+          } else {
+            console.warn('[ASIGN_USER_SYNC] modifyUserName 失败', modifyResult);
+          }
+        }
+      } else if (asign_code === '100025') {
+        console.log('[ASIGN_USER_SYNC] 用户不存在');
+      } else if (asign_code === '100082') {
+        console.log('[ASIGN_USER_SYNC] 用户是陌生人，调用 modifyStranger 同步');
+        const name = String(employeeForm.name ?? '').trim();
+        const mobile = String(employeeForm.phone ?? '').trim();
+        const modifyResult = await modifyAsignStrangerInfo({
+          account,
+          id_card: idCard,
+          user_type: 2,
+          name,
+          mobile,
+        });
+        if (modifyResult.ok) {
+          console.log('[ASIGN_USER_SYNC] modifyStranger 成功', modifyResult);
+        } else {
+          console.warn('[ASIGN_USER_SYNC] modifyStranger 失败', modifyResult);
+        }
+      } else {
+        console.log('[ASIGN_USER_SYNC] 用户状态未知');
+      }
+      return status;
+    } catch (error) {
+      console.error('[ASIGN_USER_SYNC] 异常', error);
+      return null;
+    }
+  };
+
   const handleOpenDialog = (employee?: Employee) => {
     // 重置验证状态
     setIdCardVerified(null);
@@ -302,10 +374,11 @@ export default function EmployeesPage() {
       ...formData,
       insurance_start_date: formData.insurance_start_date && formData.insurance_start_date !== '无' ? formData.insurance_start_date : null // 将"无"转换为null
     };
-
+    // 编辑员工
     if (editingEmployee) {
       const success = await updateEmployee(editingEmployee.id, submitData);
       if (success) {
+        await syncAsignUserInfoAfterEmployeeEdit(submitData);
         toast.success('更新成功');
         setDialogOpen(false);
         loadData();
@@ -313,6 +386,7 @@ export default function EmployeesPage() {
         toast.error('更新失败');
       }
     } else {
+      // 创建员工
       try {
         const result = await createEmployee(submitData);
         if (result) {
@@ -341,8 +415,28 @@ export default function EmployeesPage() {
   const handleDelete = async (id: string) => {
     if (!confirm('确定要删除这个员工吗？')) return;
 
+    const employee = employees.find((item) => item.id === id);
+    const idCard = String(employee?.id_card_number ?? '').trim().replace(/\s/g, '').toUpperCase();
+    const account = idCard ? buildAsignPersonalAccount(idCard) : '';
+
     const success = await deleteEmployee(id);
+
     if (success) {
+      if (account) {
+        console.log('[ASIGN_USER_SYNC] 员工删除成功，调用 user/remove', { account, idCard });
+        try {
+          const removeResult = await removeAsignUser({ account, id_card: idCard });
+          if (removeResult.ok) {
+            console.log('[ASIGN_USER_SYNC] user/remove 成功', removeResult);
+          } else {
+            console.warn('[ASIGN_USER_SYNC] user/remove 失败', removeResult);
+          }
+        } catch (error) {
+          console.error('[ASIGN_USER_SYNC] user/remove 异常', error);
+        }
+      } else {
+        console.log('[ASIGN_USER_SYNC] 跳过 user/remove：员工无身份证号');
+      }
       toast.success('删除成功');
       loadData();
     } else {

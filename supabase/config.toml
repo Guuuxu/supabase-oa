@@ -454,6 +454,34 @@ verify_jwt = true
 import_map = "./functions/get-asign-template-list/deno.json"
 entrypoint = "./functions/get-asign-template-list/index.ts"
 
+# 爱签：user/getUser 查询用户信息（员工编辑后同步爱签状态）
+[functions.get-asign-user]
+enabled = true
+verify_jwt = true
+import_map = "./functions/get-asign-user/deno.json"
+entrypoint = "./functions/get-asign-user/index.ts"
+
+# 爱签：v2/user/modifyUserName 已认证用户更新姓名/手机号
+[functions.modify-asign-user]
+enabled = true
+verify_jwt = true
+import_map = "./functions/modify-asign-user/deno.json"
+entrypoint = "./functions/modify-asign-user/index.ts"
+
+# 爱签：v2/user/modifyStranger 陌生用户更新信息
+[functions.modify-asign-stranger]
+enabled = true
+verify_jwt = true
+import_map = "./functions/modify-asign-stranger/deno.json"
+entrypoint = "./functions/modify-asign-stranger/index.ts"
+
+# 爱签：user/remove 删除爱签认证用户
+[functions.remove-asign-user]
+enabled = true
+verify_jwt = true
+import_map = "./functions/remove-asign-user/deno.json"
+entrypoint = "./functions/remove-asign-user/index.ts"
+
 # 管理员创建用户（service_role + auth.admin.createUser，避免前端 signUp 抢占会话）
 [functions.admin-create-user]
 enabled = true

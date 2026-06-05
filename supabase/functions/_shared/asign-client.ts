@@ -55,6 +55,17 @@ export function isAsignAddStrangerBenignResponse(asign: Record<string, unknown>)
   return false;
 }
 
+/**
+ * user/getUser：100000/100025/100082 均为有效状态查询结果（非接口失败），须继续后续流程。
+ * 100082 时 msg 可能为「用户未认证」，仍表示陌生用户可继续 modifyStranger 等。
+ */
+export function isAsignGetUserStatusResponse(asign: Record<string, unknown>): boolean {
+  if (!asign || typeof asign !== "object") return false;
+  if (isAsignBizSuccessResponse(asign)) return true;
+  const codeStr = String(asign.code ?? "").trim();
+  return codeStr === "100025" || codeStr === "100082";
+}
+
 function base64ToBytes(base64: string): Uint8Array {
   const normalized = normalizeBase64(base64.trim());
   return decodeBase64(normalized);
@@ -275,7 +286,7 @@ export function bizDataRecordLikeNodeDemoGeneric(raw: Record<string, unknown>): 
 export function getAsignBaseUrl() {
   let baseUrl = Deno.env.get("ASIGN_BASE_URL")?.trim();
   if (!baseUrl) {
-    baseUrl = "https://oapi.asign.cn";
+    baseUrl = "https://prev.asign.cn";
   }
   return baseUrl.replace(/\/+$/, "");
 }
@@ -676,8 +687,10 @@ export async function callAsignFormPost(args: CallAsignFormPostArgs) {
     const isAsignError = !isAsignBizSuccessResponse(asign);
     const addStrangerProceed =
       pathClean.includes("addStranger") && isAsignAddStrangerBenignResponse(asign);
+    const getUserProceed =
+      pathClean.includes("getUser") && isAsignGetUserStatusResponse(asign);
 
-    if (res.ok && (!isAsignError || addStrangerProceed)) {
+    if (res.ok && (!isAsignError || addStrangerProceed || getUserProceed)) {
       return { ok: true as const, status: res.status, data };
     }
 

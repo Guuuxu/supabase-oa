@@ -1205,6 +1205,227 @@ export type GetAsignTemplateListResult =
     }
   | { ok: false; error: string; detail?: unknown; debug?: unknown };
 
+export type AsignUserQueryStatus = 'verified' | 'not_exists' | 'stranger' | 'unknown';
+
+export type QueryAsignUserInfoResult =
+  | {
+      ok: true;
+      account: string;
+      status: AsignUserQueryStatus;
+      asign_code: string | null;
+      asign_msg: string | null;
+      user_data: Record<string, unknown> | null;
+      data: unknown;
+    }
+  | { ok: false; error: string; detail?: unknown; debug?: unknown };
+
+export type ModifyAsignUserInfoResult =
+  | {
+      ok: true;
+      account: string;
+      asign_code: string | null;
+      asign_msg: string | null;
+      asign_data: string | null;
+      data: unknown;
+    }
+  | { ok: false; error: string; asign_code?: string | null; asign_msg?: string | null; asign_data?: string | null; detail?: unknown; debug?: unknown };
+
+/** Edge modify-asign-user：爱签 v2/user/modifyUserName，已认证用户更新姓名/手机号 */
+export async function modifyAsignUserInfo(params: {
+  account?: string;
+  id_card?: string;
+  name: string;
+  mobile?: string;
+  bank_card?: string;
+  identify_type?: 2 | 3;
+}): Promise<ModifyAsignUserInfoResult> {
+  const id_card = (params.id_card ?? '').trim().replace(/\s/g, '').toUpperCase();
+  const account = (params.account ?? '').trim() || (id_card ? `ASIGN${id_card}` : '');
+  const name = (params.name ?? '').trim();
+  if (!account) {
+    return { ok: false, error: '缺少 account 或 id_card' };
+  }
+  if (!name) {
+    return { ok: false, error: '缺少 name' };
+  }
+  const { data, error } = await supabase.functions.invoke('modify-asign-user', {
+    body: {
+      account,
+      name,
+      mobile: params.mobile,
+      bank_card: params.bank_card,
+      identify_type: params.identify_type,
+    },
+  });
+  if (error) {
+    return { ok: false, error: error.message };
+  }
+  const payload = data as Record<string, unknown> | null;
+  if (!payload || payload.ok !== true) {
+    const errMsg =
+      payload && typeof payload.error === 'string' ? payload.error : '更新爱签用户信息失败';
+    return {
+      ok: false,
+      error: errMsg,
+      asign_code: payload?.asign_code != null ? String(payload.asign_code) : null,
+      asign_msg: payload?.asign_msg != null ? String(payload.asign_msg) : null,
+      asign_data: payload?.asign_data != null ? String(payload.asign_data) : null,
+      detail: payload?.detail,
+      debug: payload?.debug,
+    };
+  }
+  return {
+    ok: true,
+    account: typeof payload.account === 'string' ? payload.account : account,
+    asign_code: payload.asign_code != null ? String(payload.asign_code) : null,
+    asign_msg: payload.asign_msg != null ? String(payload.asign_msg) : null,
+    asign_data: payload.asign_data != null ? String(payload.asign_data) : null,
+    data: payload.data,
+  };
+}
+
+export type ModifyAsignStrangerInfoResult = ModifyAsignUserInfoResult;
+
+/** Edge modify-asign-stranger：爱签 v2/user/modifyStranger，陌生用户更新姓名/手机号/身份证 */
+export async function modifyAsignStrangerInfo(params: {
+  account?: string;
+  id_card?: string;
+  user_type?: 2;
+  name?: string;
+  mobile?: string;
+}): Promise<ModifyAsignStrangerInfoResult> {
+  const id_card = (params.id_card ?? '').trim().replace(/\s/g, '').toUpperCase();
+  const account = (params.account ?? '').trim() || (id_card ? `ASIGN${id_card}` : '');
+  if (!account) {
+    return { ok: false, error: '缺少 account 或 id_card' };
+  }
+  const { data, error } = await supabase.functions.invoke('modify-asign-stranger', {
+    body: {
+      account,
+      id_card,
+      user_type: params.user_type ?? 2,
+      name: params.name,
+      mobile: params.mobile,
+    },
+  });
+  if (error) {
+    return { ok: false, error: error.message };
+  }
+  const payload = data as Record<string, unknown> | null;
+  if (!payload || payload.ok !== true) {
+    const errMsg =
+      payload && typeof payload.error === 'string' ? payload.error : '更新爱签陌生用户信息失败';
+    return {
+      ok: false,
+      error: errMsg,
+      asign_code: payload?.asign_code != null ? String(payload.asign_code) : null,
+      asign_msg: payload?.asign_msg != null ? String(payload.asign_msg) : null,
+      asign_data: payload?.asign_data != null ? String(payload.asign_data) : null,
+      detail: payload?.detail,
+      debug: payload?.debug,
+    };
+  }
+  return {
+    ok: true,
+    account: typeof payload.account === 'string' ? payload.account : account,
+    asign_code: payload.asign_code != null ? String(payload.asign_code) : null,
+    asign_msg: payload.asign_msg != null ? String(payload.asign_msg) : null,
+    asign_data: payload.asign_data != null ? String(payload.asign_data) : null,
+    data: payload.data,
+  };
+}
+
+export type RemoveAsignUserResult = ModifyAsignUserInfoResult;
+
+/** Edge remove-asign-user：爱签 user/remove，删除爱签认证用户 */
+export async function removeAsignUser(params: {
+  account?: string;
+  id_card?: string;
+}): Promise<RemoveAsignUserResult> {
+  const id_card = (params.id_card ?? '').trim().replace(/\s/g, '').toUpperCase();
+  const account = (params.account ?? '').trim() || (id_card ? `ASIGN${id_card}` : '');
+  if (!account) {
+    return { ok: false, error: '缺少 account 或 id_card' };
+  }
+  const { data, error } = await supabase.functions.invoke('remove-asign-user', {
+    body: { account, id_card },
+  });
+  if (error) {
+    return { ok: false, error: error.message };
+  }
+  const payload = data as Record<string, unknown> | null;
+  if (!payload || payload.ok !== true) {
+    const errMsg =
+      payload && typeof payload.error === 'string' ? payload.error : '删除爱签用户失败';
+    return {
+      ok: false,
+      error: errMsg,
+      asign_code: payload?.asign_code != null ? String(payload.asign_code) : null,
+      asign_msg: payload?.asign_msg != null ? String(payload.asign_msg) : null,
+      asign_data: payload?.asign_data != null ? String(payload.asign_data) : null,
+      detail: payload?.detail,
+      debug: payload?.debug,
+    };
+  }
+  return {
+    ok: true,
+    account: typeof payload.account === 'string' ? payload.account : account,
+    asign_code: payload.asign_code != null ? String(payload.asign_code) : null,
+    asign_msg: payload.asign_msg != null ? String(payload.asign_msg) : null,
+    asign_data: payload.asign_data != null ? String(payload.asign_data) : null,
+    data: payload.data,
+  };
+}
+
+/** Edge get-asign-user：爱签 user/getUser，按 account/idCard 查询用户状态 */
+export async function queryAsignUserInfo(params: {
+  account?: string;
+  id_card?: string;
+}): Promise<QueryAsignUserInfoResult> {
+  const id_card = (params.id_card ?? '').trim().replace(/\s/g, '').toUpperCase();
+  const account = (params.account ?? '').trim() || (id_card ? `ASIGN${id_card}` : '');
+  if (!account) {
+    return { ok: false, error: '缺少 account 或 id_card' };
+  }
+  const { data, error } = await supabase.functions.invoke('get-asign-user', {
+    body: { account, id_card },
+  });
+  if (error) {
+    return { ok: false, error: error.message };
+  }
+  const payload = data as Record<string, unknown> | null;
+  if (!payload || payload.ok !== true) {
+    const errMsg =
+      payload && typeof payload.error === 'string' ? payload.error : '查询爱签用户信息失败';
+    return {
+      ok: false,
+      error: errMsg,
+      detail: payload?.detail,
+      debug: payload?.debug,
+    };
+  }
+  const statusRaw = payload.status;
+  const status: AsignUserQueryStatus =
+    statusRaw === 'verified' ||
+    statusRaw === 'not_exists' ||
+    statusRaw === 'stranger' ||
+    statusRaw === 'unknown'
+      ? statusRaw
+      : 'unknown';
+  return {
+    ok: true,
+    account: typeof payload.account === 'string' ? payload.account : account,
+    status,
+    asign_code: payload.asign_code != null ? String(payload.asign_code) : null,
+    asign_msg: payload.asign_msg != null ? String(payload.asign_msg) : null,
+    user_data:
+      payload.user_data && typeof payload.user_data === 'object'
+        ? (payload.user_data as Record<string, unknown>)
+        : null,
+    data: payload.data,
+  };
+}
+
 /** Edge get-asign-template-data：爱签 template/getTemplateData，用于配置前查看控件 key */
 export async function getAsignTemplateData(params: {
   template_ident: string;
@@ -1280,7 +1501,7 @@ export async function getAsignTemplateList(params: {
       payload.row && typeof payload.row === 'object' && !Array.isArray(payload.row)
         ? (payload.row as Record<string, unknown>)
         : undefined,
-    data: payload.data,
+    data: payload?.data,
   };
 }
 
