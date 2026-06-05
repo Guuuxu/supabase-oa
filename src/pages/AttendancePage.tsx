@@ -49,9 +49,44 @@ import {
   getEmployeesByCompany,
   getCurrentUserPermissions,
 } from '@/db/api';
-import type { AttendanceRecord, Company } from '@/types/types';
+import type { AttendanceRecord, Company, Employee } from '@/types/types';
 import * as XLSX from 'xlsx';
 import { Skeleton } from '@/components/ui/skeleton';
+
+type EmployeeMatchResult =
+  | { ok: true; employee: Employee }
+  | { ok: false; reason: 'not_found' | 'duplicate_name' | 'no_identifier' };
+
+/** 考勤上传：优先身份证号匹配；仅姓名且重名时不猜测，避免多条记录落到同一员工 */
+function matchEmployeeForAttendanceUpload(
+  employees: Employee[],
+  employeeName?: string,
+  idCardNumber?: string
+): EmployeeMatchResult {
+  const normalizedIdCard = idCardNumber?.trim();
+  const normalizedName = employeeName?.trim();
+
+  if (normalizedIdCard) {
+    const byIdCard = employees.find((e) => e.id_card_number === normalizedIdCard);
+    if (byIdCard) {
+      return { ok: true, employee: byIdCard };
+    }
+    return { ok: false, reason: 'not_found' };
+  }
+
+  if (normalizedName) {
+    const byName = employees.filter((e) => e.name === normalizedName);
+    if (byName.length === 1) {
+      return { ok: true, employee: byName[0] };
+    }
+    if (byName.length > 1) {
+      return { ok: false, reason: 'duplicate_name' };
+    }
+    return { ok: false, reason: 'not_found' };
+  }
+
+  return { ok: false, reason: 'no_identifier' };
+}
 
 export default function AttendancePage() {
   const [searchParams] = useSearchParams();
@@ -162,6 +197,7 @@ export default function AttendancePage() {
 
       // 解析考勤数据
       const attendanceRecords: Omit<AttendanceRecord, 'id' | 'created_at' | 'updated_at'>[] = [];
+      const skippedRows: string[] = [];
       
       for (const row of jsonData as any[]) {
         // 支持新旧两种格式
@@ -171,21 +207,22 @@ export default function AttendancePage() {
         const employeeName = row['员工姓名'] || row['姓名'] || row['name'];
         const idCardNumber = row['员工身份证号码'] || row['身份证号'] || row['id_card_number'];
         
-        if (!employeeName && !idCardNumber) {
-          console.warn('跳过无效行（缺少员工标识）:', row);
+        const match = matchEmployeeForAttendanceUpload(companyEmployees, employeeName, idCardNumber);
+        if (!match.ok) {
+          if (match.reason === 'no_identifier') {
+            console.warn('[考勤上传] 跳过无效行（缺少员工标识）:', row);
+            skippedRows.push('某行缺少员工姓名或身份证号');
+          } else if (match.reason === 'duplicate_name') {
+            console.warn('[考勤上传] 跳过重名员工（需填写身份证号）:', employeeName, row);
+            skippedRows.push(`「${employeeName}」存在重名，请填写身份证号`);
+          } else {
+            console.warn('[考勤上传] 未找到员工:', employeeName || idCardNumber, row);
+            skippedRows.push(`未找到员工: ${employeeName || idCardNumber}`);
+          }
           continue;
         }
 
-        // 优先通过身份证号匹配，其次姓名
-        let employee = companyEmployees.find(e => 
-          (idCardNumber && e.id_card_number === idCardNumber) ||
-          (employeeName && e.name === employeeName)
-        );
-
-        if (!employee) {
-          console.warn(`未找到员工: ${employeeName || idCardNumber}`);
-          continue;
-        }
+        const employee = match.employee;
 
         // 提取考勤月份
         const month = row['月份'] || row['考勤月份'] || row['month'] || uploadDefaultMonth;
@@ -211,15 +248,21 @@ export default function AttendancePage() {
       }
 
       if (attendanceRecords.length === 0) {
-        alert('上传失败：未能从Excel中解析出有效的考勤数据，请检查文件格式');
+        const skipHint = skippedRows.length > 0
+          ? `\n\n跳过原因：\n${[...new Set(skippedRows)].slice(0, 5).join('\n')}`
+          : '';
+        alert(`上传失败：未能从Excel中解析出有效的考勤数据，请检查文件格式${skipHint}`);
         return;
       }
 
-      console.log('准备导入的考勤记录:', attendanceRecords);
+      console.log('[考勤上传] 准备导入的考勤记录:', attendanceRecords);
 
       // 批量创建考勤记录
       const createdRecords = await createAttendanceRecordsBatch(attendanceRecords);
-      alert(`上传成功：成功导入 ${createdRecords.length} 条考勤记录`);
+      const skipHint = skippedRows.length > 0
+        ? `\n\n以下行已跳过：\n${[...new Set(skippedRows)].slice(0, 8).join('\n')}`
+        : '';
+      alert(`上传成功：成功导入 ${createdRecords.length} 条考勤记录${skipHint}`);
 
       setSelectedCompanyId(uploadCompanyId);
       resetUploadDialogDraft();
