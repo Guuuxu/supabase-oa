@@ -181,10 +181,12 @@ function buildSalaryExtraFillData(
   }
 
   const aliasPairs: Array<[string, string] | [string]> = [
+    ['月份'],
     ['出勤工资', '基本工资'],
     ['position_salary', '岗位工资'],
     ['绩效工资', '绩效奖金'],
     [ '年休假工资'],
+    ['加班', '加班小时'],
     ['平时加班工资', '加班费'],
     ['周末加班工资', '周末加班费'],
     ['节假日加班工资', '节假日加班费'],
@@ -1319,11 +1321,11 @@ export default function SalarySignaturesPage() {
           companyForFill: companyFill,
           strangers: strang,
           extraFillData: {
-            ...buildSalarySigningPeriodFillData(year, month),
             ...buildSalaryExtraFillData(unit.source.salaryData, unit.source.structureFields),
             ...buildAsignFillDataFromAttendanceRecord(
               attendanceByEmployeeId.get(unit.source.employee_id) ?? null,
             ),
+            ...buildSalarySigningPeriodFillData(year, month),
           },
           contractNoNonce: `sx${idx}`,
           displayName,
@@ -1363,11 +1365,11 @@ export default function SalarySignaturesPage() {
           asignTemplateHints: result.asignTemplateHints,
           companyFill,
           extraFillData: {
-            ...buildSalarySigningPeriodFillData(year, month),
             ...buildSalaryExtraFillData(unit.source.salaryData, unit.source.structureFields),
             ...buildAsignFillDataFromAttendanceRecord(
               attendanceByEmployeeId.get(unit.source.employee_id) ?? null,
             ),
+            ...buildSalarySigningPeriodFillData(year, month),
           },
         });
         setBatchSendProgress({ current: idx, total: workUnits.length });
@@ -1523,7 +1525,7 @@ export default function SalarySignaturesPage() {
             account: s.account,
             noticeMobile: s.mobile,
             signType: 3,
-            isNotice: 1,
+            isNotice: 1, // 测试阶段不发签署链接短信；正式环境改回 1 并传 noticeMobile
             signOrder: String(index + 1),
             signStrategyList: isCompanySigner ? companySignStrategyList : employeeSignStrategyList,
           };

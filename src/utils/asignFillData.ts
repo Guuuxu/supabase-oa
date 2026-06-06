@@ -142,6 +142,8 @@ export function buildSalarySigningPeriodFillData(year: number, month: number): R
     put('工资月份', String(m));
     put('工资月', String(m));
     put('核算月份', ym);
+    put('月份', ym);
+    put('考勤月份', ym);
     put('工资年月', ym);
     put('工资期间', `${y}年${m}月`);
     put('薪酬月份', ym);
